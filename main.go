@@ -1303,112 +1303,442 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// itemPos stores the Y-range of an item within a vertical layout.
+type itemPos struct {
+	startY int
+	endY   int
+}
+
+// measureItems computes cumulative Y positions of items stacked vertically.
+// Each item's height is measured with lipgloss.Height (matching JoinVertical).
+func measureItems(items []string) ([]itemPos, int) {
+	pos := make([]itemPos, len(items))
+	y := 0
+	for i, item := range items {
+		h := lipgloss.Height(item)
+		pos[i] = itemPos{startY: y, endY: y + h}
+		y += h
+	}
+	return pos, y
+}
+
+// contentTop returns the Y offset of centered content within the terminal.
+func (m Model) contentTop(totalH int) int {
+	top, _ := m.contentOffset(m.contentW(), totalH)
+	return top
+}
+
 // handleClick maps a mouse click (x, y) to the appropriate action based on
 // the current screen. Y is 0-indexed from top of terminal.
+// Positions are computed by building the exact same items as the View()
+// and measuring each item's actual rendered height with lipgloss.Height.
 func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 	switch m.screen {
 	case screenLogin:
-		// Approximate layout (centered vertically):
-		//   title (~3-4 lines)
-		//   saved config notice (optional, 1 line)
-		//   "Email" label
-		//   email input
-		//   ""
-		//   "Password" label
-		//   password input
-		//   ""
-		//   Sign In button
-		//   error/status
-		//   ""
-		//   help
-		cfg := loadConfig()
-		noticeLines := 0
-		if cfg != nil && cfg.MasterID != "" {
-			noticeLines = 1
-		}
-		titleH := 3 // double border + text
-		totalH := titleH + 1 + noticeLines + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
-		top, _ := m.contentOffset(60, totalH)
-		row := y - top
-		emailRow := titleH + 1 + noticeLines + 1 // "Email" label row
-		passRow := emailRow + 1 + 1 + 1          // input + empty + "Password" label
-		btnRow := passRow + 1 + 1 + 1            // input + empty
-		if row == emailRow || (row >= emailRow && row < passRow-1) {
-			m.loginFocus = 0
-			m.emailInput.Focus()
-			m.passInput.Blur()
-		} else if row == passRow || (row >= passRow && row < btnRow-1) {
-			m.loginFocus = 1
-			m.passInput.Focus()
-			m.emailInput.Blur()
-		} else if row == btnRow {
-			m.loginFocus = 2
-			m.emailInput.Blur()
-			m.passInput.Blur()
-			return m.doLogin()
-		}
-
+		return m.handleClickLogin(y)
 	case screenAccounts:
-		// layout: title (~3) + "" + stepLabel + "" + panel_top + N rows + panel_bottom + "" + help
-		n := len(m.accounts)
-		if m.pickStep == pickSlave && !m.editMode {
-			n++ // Done button
-		}
-		titleH := 3
-		totalH := titleH + 1 + 2 + 1 + 1 + n + 1 + 1 + 1
-		top, _ := m.contentOffset(72, totalH)
-		rowStart := top + titleH + 1 + 2 + 1 + 1 // above the panel border
-		row := y - rowStart
-		if row >= 0 && row < len(m.accounts) {
-			m.cursor = row
-			// Act like Enter was pressed on this row
-			return m.handleAccountsEnter()
-		}
-		if row == len(m.accounts) && m.pickStep == pickSlave && !m.editMode {
-			m.cursor = row
-			return m.handleAccountsEnter()
-		}
-
+		return m.handleClickAccounts(y)
 	case screenEdit:
-		n := len(m.pendingSlaves) + 2 // rows + Add + Apply
-		titleH := 3
-		totalH := titleH + 1 + 1 + n + 1 + 1 + 1
-		top, _ := m.contentOffset(72, totalH)
-		rowStart := top + titleH + 1 + 1 + 1 // above panel border
-		row := y - rowStart
-		if row >= 0 && row < n {
-			m.cursor = row
-			// Trigger the same action as pressing Enter on the focused row
-			if row == len(m.pendingSlaves) {
-				// "Add slave" — same as handleEditKey's Enter handler
-				m.editMode = true
-				m.pickStep = pickSlave
-				m.slaveID = ""
-				m.cursor = 0
-				m.screen = screenAccounts
-				return m, nil
-			}
-			if row == len(m.pendingSlaves)+1 {
-				// "Apply & restart"
-				if len(m.pendingSlaves) > 0 {
-					return m.applyEdit()
-				}
-			}
-		}
-
+		return m.handleClickEdit(y)
 	case screenMultiplier:
-		// Click on the input area ~ centered vertically
-		titleH := 3
-		totalH := titleH + 1 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1
-		top, _ := m.contentOffset(60, totalH)
-		row := y - top
-		inputRow := titleH + 1 + 2 + 2
-		btnRow := inputRow + 1 + 1 // input + empty
-		if row >= inputRow && row < btnRow-1 {
-			m.multInput.Focus()
+		return m.handleClickMultiplier(y)
+	}
+	return m, nil
+}
+
+func (m Model) handleClickLogin(y int) (tea.Model, tea.Cmd) {
+	title := styleTitle.Render("  ◈  FundingPips Trade Copier  ")
+	notice := ""
+	if cfg := loadConfig(); cfg != nil {
+		slaveCount := len(cfg.Slaves)
+		suffix := fmt.Sprintf("master #%s → %d slave(s)", cfg.MasterID, slaveCount)
+		notice = styleDim.Render("  Saved config found — " + suffix)
+	}
+	emailBox := styleInput.Render(m.emailInput.View())
+	passBox := styleInput.Render(m.passInput.View())
+	btn := styleBtn.Render("   Sign In   ")
+	errLine := ""
+	if m.loginErr != "" {
+		errLine = "\n" + styleLogErr.Render("  ⚠  " + m.loginErr)
+	}
+	status := ""
+	if m.connecting {
+		status = "\n" + m.spinner.View() + styleBlue.Render("  Signing in...")
+	}
+	help := styleDim.Render("  Tab · ↑↓  navigate    Enter  confirm    Ctrl+C  quit")
+
+	// Exact same items as viewLogin()
+	items := []string{
+		title, "",
+		notice, "",
+		styleLabel.Render("  Email"), emailBox,
+		"",
+		styleLabel.Render("  Password"), passBox,
+		"",
+		btn,
+		errLine, status,
+		"", help,
+	}
+	pos, totalH := measureItems(items)
+	top := m.contentTop(totalH)
+	relY := y - top
+	if relY < 0 || relY >= totalH {
+		return m, nil
+	}
+
+	for i, p := range pos {
+		if p.startY <= relY && relY < p.endY {
+			switch i {
+			case 5: // emailBox
+				m.loginFocus = 0
+				m.emailInput.Focus()
+				m.passInput.Blur()
+			case 8: // passBox
+				m.loginFocus = 1
+				m.passInput.Focus()
+				m.emailInput.Blur()
+			case 10: // btn
+				m.loginFocus = 2
+				m.emailInput.Blur()
+				m.passInput.Blur()
+				return m.doLogin()
+			}
+			break
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleClickAccounts(y int) (tea.Model, tea.Cmd) {
+	title := styleTitle.Render("  ◈  Select Accounts  ")
+
+	var stepLabel string
+	if m.pickStep == pickMaster {
+		stepLabel = styleMasterTag.Render(" MASTER ") + styleDim.Render("  Choose the account to copy FROM")
+	} else {
+		pendingStr := ""
+		if len(m.pendingSlaves) > 0 {
+			var ids []string
+			for _, ps := range m.pendingSlaves {
+				ids = append(ids, "#"+ps.AccountID+"×"+fmt.Sprintf("%.2f", ps.Multiplier))
+			}
+			pendingStr = "  " + styleDim.Render("| selected: ") + styleGreen.Render(strings.Join(ids, ", "))
+		}
+		stepLabel = styleSlaveTag.Render(" SLAVE ") + styleDim.Render("  Choose accounts to copy TO") +
+			"  " + styleDim.Render("master: ") + styleBlue.Render("#"+m.masterID) + pendingStr
+	}
+
+	// If verifying accounts — no clickable items
+	if m.verifyingAccts {
+		return m, nil
+	}
+
+	// Build account rows (exact same as viewAccounts) and track clickable row → account index
+	pickedIDs := make(map[string]bool)
+	for _, ps := range m.pendingSlaves {
+		pickedIDs[ps.AccountID] = true
+	}
+
+	rowW := m.contentW() - 6
+	idW := 10
+	curW := 8
+	typeW := 6
+	nameW := rowW - idW - curW - typeW - 8
+	if nameW < 10 {
+		idW = 6
+		curW = 4
+		nameW = rowW - idW - curW - typeW - 8
+		if nameW < 5 {
+			nameW = 5
 		}
 	}
 
+	var rows []string
+	var rowToAcctIdx []int // maps row index within panel content → account index
+	for i, acc := range m.accounts {
+		isMaster := acc.TradingAccountID == m.masterID
+		isPicked := pickedIDs[acc.TradingAccountID]
+		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
+
+		if m.verifiedAccts != nil && m.pickStep == pickSlave && !isMaster && !isPicked {
+			if !m.verifiedAccts[acc.TradingAccountID] {
+				continue
+			}
+		}
+
+		name := acc.Offer.Description
+		if name == "" {
+			name = acc.Offer.Name
+		}
+		acctType := "DEMO"
+		if !acc.Offer.Demo {
+			acctType = "LIVE"
+		}
+
+		if isMaster && m.pickStep == pickSlave {
+			line := fmt.Sprintf("  ▶  #%-*s  %-*s  %-*s  [%s]",
+				idW, truncate(acc.TradingAccountID, idW),
+				curW, truncate(acc.Offer.Currency, curW),
+				nameW, truncate(name, nameW),
+				acctType)
+			rows = append(rows, styleDim.Render(line)+"  "+styleMasterTag.Render(" SOURCE "))
+			rowToAcctIdx = append(rowToAcctIdx, -1) // not clickable (master header)
+			continue
+		}
+
+		if isDisabled {
+			continue
+		}
+
+		line := fmt.Sprintf("  #%-*s  %-*s  %-*s  [%s]",
+			idW, truncate(acc.TradingAccountID, idW),
+			curW, truncate(acc.Offer.Currency, curW),
+			nameW, truncate(name, nameW),
+			acctType,
+		)
+		var row string
+		if i == m.cursor {
+			row = styleAccountRowFocused.Render(line)
+		} else {
+			row = styleAccountRow.Render(line)
+		}
+		rows = append(rows, row)
+		rowToAcctIdx = append(rowToAcctIdx, i)
+	}
+
+	if m.pickStep == pickSlave && !m.editMode {
+		doneLabel := "  ✓  Done selecting slaves"
+		if m.cursor == len(m.accounts) {
+			rows = append(rows, styleAccountRowFocused.Render(doneLabel))
+		} else {
+			rows = append(rows, styleAccountRow.Render(doneLabel))
+		}
+		rowToAcctIdx = append(rowToAcctIdx, -2) // -2 = Done button
+	}
+
+	list := stylePanel.Render(strings.Join(rows, "\n"))
+	help := styleDim.Render("  ↑↓ / j k  navigate    Enter / Space  select    Esc / b  back    q  quit")
+
+	// Items: [title, "", stepLabel, "", list, "", help]
+	items := []string{title, "", stepLabel, "", list, "", help}
+	pos, totalH := measureItems(items)
+	top := m.contentTop(totalH)
+	relY := y - top
+	if relY < 0 || relY >= totalH {
+		return m, nil
+	}
+
+	// item 3 = 'list' (the panel)
+	if pos[3].startY <= relY && relY < pos[3].endY {
+		// Inside the panel: skip top border (1 line)
+		rowIdx := relY - pos[3].startY - 1
+		if rowIdx >= 0 && rowIdx < len(rowToAcctIdx) {
+			acctIdx := rowToAcctIdx[rowIdx]
+			if acctIdx == -2 {
+				// Done button
+				m.cursor = len(m.accounts)
+				return m.handleAccountsEnter()
+			}
+			if acctIdx >= 0 {
+				m.cursor = acctIdx
+				return m.handleAccountsEnter()
+			}
+			// acctIdx == -1 is master header — no action
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleClickEdit(y int) (tea.Model, tea.Cmd) {
+	title := styleTitle.Render("  ◈  Edit Configuration  ")
+
+	var rows []string
+	maxW := m.contentW() - 6
+	masterLine := styleBlue.Render("⬟ MASTER") + "  " + styleLabel.Render("#" + m.masterID)
+	rows = append(rows, "  "+truncate(masterLine, maxW), "")
+
+	nSlaves := len(m.pendingSlaves)
+	if nSlaves == 0 {
+		rows = append(rows, styleDim.Render("  — no slaves configured —"))
+	} else {
+		for i, ps := range m.pendingSlaves {
+			line := fmt.Sprintf("  SLAVE %d:  #%-*s  ×%.2f", i+1,
+				min(10, maxW-20), truncate(ps.AccountID, min(10, maxW-20)),
+				ps.Multiplier)
+			if i == m.cursor {
+				rows = append(rows, styleAccountRowFocused.Render(line))
+			} else {
+				rows = append(rows, styleAccountRow.Render(line))
+			}
+		}
+	}
+
+	addLine := "  [+] Add slave"
+	if m.cursor == nSlaves {
+		rows = append(rows, styleAccountRowFocused.Render(addLine))
+	} else {
+		rows = append(rows, styleAccountRow.Render(addLine))
+	}
+	applyLine := "  [>] Apply & restart copier"
+	if m.cursor == nSlaves+1 {
+		rows = append(rows, styleAccountRowFocused.Render(applyLine))
+	} else {
+		rows = append(rows, styleAccountRow.Render(applyLine))
+	}
+
+	list := stylePanel.Render(strings.Join(rows, "\n"))
+	help := styleDim.Render("  ↑↓  navigate    r  remove slave    m  change multiplier    Enter  confirm    Esc  back    q  quit")
+
+	// Items: [title, "", list, "", help]
+	items := []string{title, "", list, "", help}
+	pos, totalH := measureItems(items)
+	top := m.contentTop(totalH)
+	relY := y - top
+	if relY < 0 || relY >= totalH {
+		return m, nil
+	}
+
+	// item 2 = 'list' (the panel)
+	if pos[2].startY <= relY && relY < pos[2].endY {
+		// Inside panel: skip top border (1 line)
+		rowIdx := relY - pos[2].startY - 1 // index into rows[]
+		if rowIdx < 0 || rowIdx >= len(rows) {
+			return m, nil
+		}
+
+		// rows layout: [master(0), empty(1), slave rows or no-slaves(2..), add, apply]
+		// When nSlaves==0, a "no slaves" text occupies rows[2], shifting add/apply
+		noSlavesShift := 0
+		if nSlaves == 0 {
+			noSlavesShift = 1
+		}
+
+		if rowIdx >= 2 && rowIdx < 2+nSlaves {
+			// Slave row
+			m.cursor = rowIdx - 2
+			return m, nil
+		}
+		if rowIdx == 2+nSlaves+noSlavesShift {
+			// Add slave
+			m.editMode = true
+			m.pickStep = pickSlave
+			m.slaveID = ""
+			m.cursor = 0
+			m.screen = screenAccounts
+			return m, nil
+		}
+		if rowIdx == 2+nSlaves+noSlavesShift+1 {
+			// Apply & restart
+			if nSlaves > 0 {
+				return m.applyEdit()
+			}
+		}
+	}
+	return m, nil
+}
+
+func (m Model) handleClickMultiplier(y int) (tea.Model, tea.Cmd) {
+	title := styleTitle.Render("  ◈  Lot Multiplier  ")
+
+	var summary string
+	var btn string
+	if m.slaveID != "" {
+		summary = lipgloss.JoinHorizontal(lipgloss.Top,
+			styleDim.Render("Master  "), styleMasterTag.Render(" #"+m.masterID+" "),
+			styleDim.Render("  →  "),
+			styleSlaveTag.Render(" #"+m.slaveID+" "), styleDim.Render("  Slave"),
+		)
+		btn = styleBtnFocused.Render(" ▶  Add Slave  ")
+	} else {
+		var pendingStr string
+		if len(m.pendingSlaves) > 0 {
+			var ids []string
+			for _, ps := range m.pendingSlaves {
+				ids = append(ids, "#"+ps.AccountID+"×"+fmt.Sprintf("%.2f", ps.Multiplier))
+			}
+			pendingStr = styleGreen.Render(strings.Join(ids, ", "))
+		}
+		summary = lipgloss.JoinHorizontal(lipgloss.Top,
+			styleDim.Render("Master  "), styleMasterTag.Render(" #"+m.masterID+" "),
+			styleDim.Render("  →  "),
+			styleSlaveTag.Render(fmt.Sprintf(" %d slave(s) ", len(m.pendingSlaves))),
+			"  "+pendingStr,
+		)
+		btn = styleBtnFocused.Render(" ▶  Start Copier  ")
+	}
+
+	desc := styleDim.Render("  Scale slave lot size relative to master.\n  1.0 = same size  ·  0.5 = half  ·  2.0 = double")
+	box := styleFocused.Render(m.multInput.View())
+	errLine := ""
+	if m.multErr != "" {
+		errLine = "\n" + styleLogErr.Render("  ⚠  " + m.multErr)
+	}
+	help := styleDim.Render("  Enter  confirm    Esc / b  back    Ctrl+C  quit")
+
+	// Same items as viewMultiplier
+	items := []string{
+		title, "",
+		summary, "",
+		desc, "",
+		box,
+		errLine, "",
+		btn,
+		"", help,
+	}
+	pos, totalH := measureItems(items)
+	top := m.contentTop(totalH)
+	relY := y - top
+	if relY < 0 || relY >= totalH {
+		return m, nil
+	}
+
+	// item 6 = box (multiplier input), item 9 = btn
+	for i, p := range pos {
+		if p.startY <= relY && relY < p.endY {
+			switch i {
+			case 6: // box
+				m.multInput.Focus()
+			case 9: // btn — same as pressing Enter
+				mult, err := strconv.ParseFloat(strings.TrimSpace(m.multInput.Value()), 64)
+				if err != nil || mult <= 0 {
+					m.multErr = "Must be a positive number (e.g. 1.0)"
+					return m, nil
+				}
+				m.multErr = ""
+				m.pendingSlaveMult = mult
+
+				if m.editMode {
+					found := false
+					for i := range m.pendingSlaves {
+						if m.pendingSlaves[i].AccountID == m.slaveID {
+							m.pendingSlaves[i].Multiplier = mult
+							found = true
+							break
+						}
+					}
+					if !found {
+						m.pendingSlaves = append(m.pendingSlaves, SlaveConfig{
+							AccountID: m.slaveID, Multiplier: mult,
+						})
+					}
+					m.slaveID = ""
+					m.editMode = false
+					m.screen = screenEdit
+					return m, nil
+				}
+				if m.slaveID != "" {
+					m.pendingSlaves = append(m.pendingSlaves, SlaveConfig{
+						AccountID: m.slaveID, Multiplier: mult,
+					})
+					m.slaveID = ""
+					m.screen = screenAccounts
+					return m, nil
+				}
+				return m.startCopier()
+			}
+			break
+		}
+	}
 	return m, nil
 }
 
