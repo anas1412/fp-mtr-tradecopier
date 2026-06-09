@@ -223,6 +223,17 @@ var (
 			Foreground(clrBg).
 			Bold(true).
 			Padding(0, 1)
+
+	styleFooterBtn = lipgloss.NewStyle().
+			Background(clrPanel).
+			Foreground(clrWhite).
+			Padding(0, 2)
+
+	styleFooterBtnAccent = lipgloss.NewStyle().
+				Background(clrBlue).
+				Foreground(clrBg).
+				Bold(true).
+				Padding(0, 2)
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1342,6 +1353,8 @@ func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 		return m.handleClickEdit(y)
 	case screenMultiplier:
 		return m.handleClickMultiplier(y)
+	case screenCopying:
+		return m.handleClickCopying(x, y)
 	}
 	return m, nil
 }
@@ -1738,6 +1751,65 @@ func (m Model) handleClickMultiplier(y int) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
+	}
+	return m, nil
+}
+
+func (m Model) handleClickCopying(x, y int) (tea.Model, tea.Cmd) {
+	// Render full copying view to measure body height
+	body := m.viewCopying()
+	bodyH := lipgloss.Height(body)
+
+	// Footer is the last line of the body
+	if y != bodyH-1 {
+		return m, nil
+	}
+
+	// Build footer buttons (same as viewCopying) to measure individual widths
+	var btnStrs []string
+	if m.paused {
+		btnStrs = append(btnStrs, styleFooterBtnAccent.Render(" ▶ p Resume "))
+	} else {
+		btnStrs = append(btnStrs, styleFooterBtn.Render(" ⏸ p Pause "))
+	}
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ⚙ s Settings "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ✎ e Edit "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ⇥ l Logout "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ✕ q Quit "))
+
+	runningX := 0
+	for idx, btn := range btnStrs {
+		btnW := lipgloss.Width(btn)
+		if x >= runningX && x < runningX+btnW {
+			switch idx {
+			case 0: // Pause/Resume
+				m.paused = !m.paused
+				if m.paused {
+					m.log(LogInfo, "Copier paused")
+					m.notifier.Send("copier_paused", NotifyInfo, "Copier Paused", "Trade copying has been paused")
+				} else {
+					m.log(LogOK, "Copier resumed")
+					m.notifier.Send("copier_resumed", NotifyInfo, "Copier Resumed", "Trade copying has been resumed")
+				}
+			case 1: // Settings
+				m.settingsInput.SetValue(fmt.Sprintf("%d", m.pollMs))
+				m.settingsInput.Focus()
+				m.screen = screenSettings
+			case 2: // Edit
+				m.pendingSlaves = make([]SlaveConfig, len(m.slaves))
+				for i, sc := range m.slaves {
+					m.pendingSlaves[i] = sc.config
+				}
+				m.screen = screenEdit
+				m.cursor = 0
+			case 3: // Logout
+				return m.logout()
+			case 4: // Quit
+				return m, tea.Quit
+			}
+			break
+		}
+		runningX += btnW
 	}
 	return m, nil
 }
@@ -2676,14 +2748,27 @@ func (m Model) viewCopying() string {
 	// Log
 	logView := m.renderLog()
 
-	footer := styleDim.Render("  q  quit    p  pause    l  logout    e  edit    s  settings")
+	// Footer with styled, clickable buttons
+	var btnStrs []string
+	if m.paused {
+		btnStrs = append(btnStrs, styleFooterBtnAccent.Render(" ▶ p Resume "))
+	} else {
+		btnStrs = append(btnStrs, styleFooterBtn.Render(" ⏸ p Pause "))
+	}
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ⚙ s Settings "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ✎ e Edit "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ⇥ l Logout "))
+	btnStrs = append(btnStrs, styleFooterBtn.Render(" ✕ q Quit "))
+	footerBtns := lipgloss.JoinHorizontal(lipgloss.Top, btnStrs...)
+	// Constrain footer width so it doesn't overflow
+	footerBtns = lipgloss.NewStyle().MaxWidth(m.width).Render(footerBtns)
 
 	body := lipgloss.JoinVertical(lipgloss.Left,
 		header, "",
 		statsBar, "",
 		panels, "",
 		logView, "",
-		footer,
+		footerBtns,
 	)
 	return lipgloss.NewStyle().MaxWidth(m.width).Render(body)
 }
