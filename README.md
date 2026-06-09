@@ -65,39 +65,6 @@ Press `s` during copying to open settings. Currently configurable:
 
 - **Poll interval (ms)** — how often the copier checks for changes. Lower = faster copy, higher = less CPU. Min 50ms. Persisted across restarts.
 
-## Autostart (systemd)
-
-```bash
-bash install.sh
-mkdir -p ~/.local/bin/fundingpips-copier
-cp copier ~/.local/bin/fundingpips-copier/
-```
-
-Create `~/.config/systemd/user/fundingpips-copier.service`:
-
-```ini
-[Unit]
-Description=FundingPips Trade Copier
-After=network.target
-
-[Service]
-ExecStart=%h/.local/bin/fundingpips-copier/copier
-WorkingDirectory=%h/.local/bin/fundingpips-copier
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Enable and start:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable fundingpips-copier
-systemctl --user start fundingpips-copier
-journalctl --user -u fundingpips-copier -f
-```
-
 ## Notes
 
 - Pre-existing positions and pending orders are **not** copied on startup — only new ones opened while the copier is running
