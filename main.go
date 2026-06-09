@@ -630,6 +630,9 @@ type slaveClient struct {
 	pendingKnown      map[string]PendingOrder
 	pendingCopied     int
 	pendingCancelled  int
+
+	// Error tracking for recovery notifications
+	hadError      bool   // true if previous poll had errors on this slave
 }
 
 type statsData struct {
@@ -675,13 +678,17 @@ type Model struct {
 	pollMs       int           // poll interval in ms (from config or default)
 	settingsInput textinput.Model
 
+	// Notifications
+	notifier *Notifier
+
 	// Copier
-	master *Client
-	slaves []*slaveClient
-	stats  statsData
-	logs   []LogEntry
-	known  map[string]Position
-	paused bool
+	master        *Client
+	masterHadError bool       // tracks master error state for recovery notification
+	slaves        []*slaveClient
+	stats          statsData
+	logs           []LogEntry
+	known          map[string]Position
+	paused         bool
 
 	// Pending order tracking (master side)
 	pendingKnown map[string]PendingOrder
@@ -725,6 +732,7 @@ func newModel() Model {
 		pendingKnown:  make(map[string]PendingOrder),
 		pendingSlaves: nil,
 		pollMs:        defaultPollMs,
+		notifier:      NewNotifier(),
 	}
 
 	// Pre-fill from saved config if available
@@ -828,8 +836,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.paused = !m.paused
 				if m.paused {
 					m.log(LogInfo, "Copier paused")
+					m.notifier.Send("copier_paused", NotifyInfo, "Copier Paused", "Trade copying has been paused")
 				} else {
 					m.log(LogOK, "Copier resumed")
+					m.notifier.Send("copier_resumed", NotifyInfo, "Copier Resumed", "Trade copying has been resumed")
 				}
 			case "e":
 				// Enter edit screen — copy current slaves into pending list
@@ -1368,6 +1378,9 @@ func (m Model) applyEdit() (tea.Model, tea.Cmd) {
 	if len(needLogin) == 0 {
 		m.screen = screenCopying
 		m.log(LogOK, "Slave configuration updated")
+		m.notifier.Send("config_updated", NotifyInfo,
+			"Configuration Updated",
+			fmt.Sprintf("Multipliers applied to %d slave(s)", len(m.slaves)))
 		return m, m.cmdSchedulePoll()
 	}
 
@@ -1397,11 +1410,17 @@ func (m Model) applyEdit() (tea.Model, tea.Cmd) {
 			m.slaves = append(m.slaves, sc)
 		}
 		errStr := ""
+		changeMsg := "Multipliers applied"
+		if len(needLogin) > 0 {
+			changeMsg = fmt.Sprintf("Multipliers applied + %d new slave(s)", len(needLogin))
+		}
 		if len(errs) > 0 {
 			errStr = strings.Join(errs, "; ")
 			m.log(LogErr, "Edit apply: "+errStr)
 		}
 		m.log(LogOK, "Slave configuration updated")
+		m.notifier.Send("config_updated", NotifyInfo,
+			"Configuration Updated", changeMsg)
 		return msgEditApplied{err: nil}
 	}
 }
@@ -1475,11 +1494,18 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 		for _, sc := range m.slaves {
 			slaveAccounts, err := sc.client.LoginAll(email, pass)
 			if err != nil {
-				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s login: %v", sc.config.AccountID, err))
+				msg := fmt.Sprintf("slave #%s login: %v", sc.config.AccountID, err)
+				slaveErrs = append(slaveErrs, msg)
+				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+					"Slave Auth Failed",
+					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
 				continue
 			}
 			if err := sc.client.SelectAccount(slaveAccounts, sc.config.AccountID); err != nil {
 				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s select: %v", sc.config.AccountID, err))
+				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+					"Slave Auth Failed",
+					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
 			}
 		}
 
@@ -1512,6 +1538,9 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 		if len(slaveErrs) > 0 {
 			return msgSeedDone{err: fmt.Errorf("slave errors: %s", strings.Join(slaveErrs, "; "))}
 		}
+		m.notifier.Send("copy_started", NotifyInfo,
+			"Copy Started",
+			fmt.Sprintf("Master #%s → %d slave(s)", m.masterID, len(m.slaves)))
 		return msgSeedDone{count: len(pos)}
 	}
 }
@@ -1579,11 +1608,27 @@ func (m *Model) doPoll() {
 	if m.screen != screenCopying || m.paused {
 		return
 	}
+
+	// ── Master positions ────────────────────────────────────────────────
+	masterHadErrorBefore := m.masterHadError
 	masterPos, err := m.master.GetOpenPositions()
 	if err != nil {
 		m.log(LogErr, "Poll: "+err.Error())
+		m.masterHadError = true
+		if !masterHadErrorBefore {
+			m.notifier.Send("master_disconnect", NotifyCritical,
+				"Master Disconnected",
+				"Cannot fetch master positions: "+err.Error())
+		}
 		return
 	}
+	m.masterHadError = false
+	if masterHadErrorBefore {
+		m.notifier.Send("master_recovered", NotifyWarning,
+			"Master Recovered",
+			"Master connection restored")
+	}
+
 	current := posMap(masterPos)
 
 	// For each master position change, apply to ALL slaves
@@ -1601,6 +1646,16 @@ func (m *Model) doPoll() {
 				if err := sc.client.OpenPosition(pos, mult); err != nil {
 					sc.errors++
 					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s open failed: %s", sc.client.accountID, err.Error()))
+					notifyKey := "trade_reject_" + sc.config.AccountID + "_" + pos.Symbol
+					if isRateLimit(err) {
+						m.notifier.Send("rate_limit", NotifyWarning,
+							"Rate Limited",
+							err.Error())
+					} else {
+						m.notifier.Send(notifyKey, NotifyCritical,
+							"Trade Rejected",
+							fmt.Sprintf("Slave #%s  %s %s: %s", sc.config.AccountID, pos.Side, pos.Symbol, err.Error()))
+					}
 				} else {
 					sc.copied++
 					scaledVol := pos.Volume
@@ -1622,6 +1677,11 @@ func (m *Model) doPoll() {
 				if err != nil {
 					sc.errors++
 					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s: could not fetch positions: %s", sc.client.accountID, err.Error()))
+					if isRateLimit(err) {
+						m.notifier.Send("rate_limit", NotifyWarning,
+							"Rate Limited",
+							err.Error())
+					}
 					continue
 				}
 				found := false
@@ -1630,6 +1690,16 @@ func (m *Model) doPoll() {
 						if err := sc.client.ClosePosition(sp); err != nil {
 							sc.errors++
 							m.log(LogErr, fmt.Sprintf("  ↳ slave #%s close failed: %s", sc.client.accountID, err.Error()))
+							notifyKey := "close_reject_" + sc.config.AccountID + "_" + pos.Symbol
+							if isRateLimit(err) {
+								m.notifier.Send("rate_limit", NotifyWarning,
+									"Rate Limited",
+									err.Error())
+							} else {
+								m.notifier.Send(notifyKey, NotifyCritical,
+									"Close Rejected",
+									fmt.Sprintf("Slave #%s  %s %s: %s", sc.config.AccountID, pos.Side, pos.Symbol, err.Error()))
+							}
 						} else {
 							sc.closed++
 							m.log(LogOK, fmt.Sprintf("  ↳ slave #%s closed ✓  P&L was %s", sc.client.accountID, sp.Profit))
@@ -1640,6 +1710,9 @@ func (m *Model) doPoll() {
 				}
 				if !found {
 					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s: no matching position for %s %s", sc.client.accountID, pos.Side, pos.Symbol))
+					m.notifier.Send("sync_mismatch_"+sc.config.AccountID+"_"+pos.Symbol, NotifyWarning,
+						"Position Sync Mismatch",
+						fmt.Sprintf("Slave #%s has no position matching %s %s", sc.config.AccountID, pos.Side, pos.Symbol))
 				}
 			}
 		}
@@ -1651,6 +1724,9 @@ func (m *Model) doPoll() {
 	masterPending, err := m.master.GetActiveOrders()
 	if err != nil {
 		m.log(LogErr, "Pending poll: "+err.Error())
+		if !masterHadErrorBefore && m.masterHadError {
+			// Error is new this poll (master is having trouble)
+		}
 	} else {
 		currentPending := pendingMap(masterPending)
 
@@ -1669,6 +1745,17 @@ func (m *Model) doPoll() {
 					if err := sc.client.CreatePendingOrder(po, mult); err != nil {
 						sc.errors++
 						m.log(LogErr, fmt.Sprintf("  ↳ slave #%s pending create failed: %s", sc.client.accountID, err.Error()))
+						notifyKey := "order_reject_" + sc.config.AccountID + "_" + po.Symbol
+						if isRateLimit(err) {
+							m.notifier.Send("rate_limit", NotifyWarning,
+								"Rate Limited",
+								err.Error())
+						} else {
+							m.notifier.Send(notifyKey, NotifyCritical,
+								"Pending Order Rejected",
+								fmt.Sprintf("Slave #%s  %s %s %s: %s",
+									sc.config.AccountID, po.Type, po.Side, po.Symbol, err.Error()))
+						}
 					} else {
 						sc.pendingCopied++
 						scaledVol := po.Volume
@@ -1690,6 +1777,17 @@ func (m *Model) doPoll() {
 					if err := sc.client.CancelPendingOrder(po); err != nil {
 						sc.errors++
 						m.log(LogErr, fmt.Sprintf("  ↳ slave #%s cancel pending failed: %s", sc.client.accountID, err.Error()))
+						notifyKey := "cancel_reject_" + sc.config.AccountID + "_" + po.Symbol
+						if isRateLimit(err) {
+							m.notifier.Send("rate_limit", NotifyWarning,
+								"Rate Limited",
+								err.Error())
+						} else {
+							m.notifier.Send(notifyKey, NotifyCritical,
+								"Cancel Rejected",
+								fmt.Sprintf("Slave #%s  %s %s %s: %s",
+									sc.config.AccountID, po.Type, po.Side, po.Symbol, err.Error()))
+						}
 					} else {
 						sc.pendingCancelled++
 						m.log(LogOK, fmt.Sprintf("  ↳ slave #%s pending cancelled ✓", sc.client.accountID))
@@ -1701,14 +1799,56 @@ func (m *Model) doPoll() {
 		m.pendingKnown = currentPending
 	}
 
+	// ── Slave balances & recovery detection ─────────────────────────────
 	masterBal, _ := m.master.GetBalance()
 	for _, sc := range m.slaves {
-		sc.balance, _ = sc.client.GetBalance()
-		sc.positions, _ = sc.client.GetOpenPositions()
+		hadErrorBefore := sc.hadError
+		pollHadError := false
+
+		bal, err := sc.client.GetBalance()
+		if err != nil {
+			pollHadError = true
+			if isRateLimit(err) {
+				m.notifier.Send("rate_limit", NotifyWarning,
+					"Rate Limited",
+					err.Error())
+			}
+			// Check for auth failure
+			if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
+				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+					"Slave Auth Failed",
+					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
+			}
+		} else {
+			sc.balance = bal
+		}
+
+		pos, err := sc.client.GetOpenPositions()
+		if err != nil {
+			pollHadError = true
+			if strings.Contains(err.Error(), "unauthorized") || strings.Contains(err.Error(), "401") {
+				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+					"Slave Auth Failed",
+					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
+			}
+		} else {
+			sc.positions = pos
+		}
+
 		// Update slave pending order list too
-		if slavePending, err := sc.client.GetActiveOrders(); err == nil {
+		if slavePending, err := sc.client.GetActiveOrders(); err != nil {
+			pollHadError = true
+		} else {
 			sc.pendingKnown = pendingMap(slavePending)
 		}
+
+		// Recovery detection
+		if hadErrorBefore && !pollHadError {
+			m.notifier.Send("slave_recovered_"+sc.config.AccountID, NotifyWarning,
+				"Slave Recovered",
+				fmt.Sprintf("Account #%s connection restored", sc.config.AccountID))
+		}
+		sc.hadError = pollHadError
 	}
 
 	m.stats.mu.Lock()
@@ -2082,13 +2222,14 @@ func (m Model) viewCopying() string {
 
 	footer := styleDim.Render("  q  quit    p  pause    l  logout    e  edit    s  settings")
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	body := lipgloss.JoinVertical(lipgloss.Left,
 		header, "",
 		statsBar, "",
 		panels, "",
 		logView, "",
 		footer,
 	)
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(body)
 }
 
 func (m Model) viewSettings() string {
@@ -2165,6 +2306,12 @@ func (m Model) viewEdit() string {
 }
 
 func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, positions []Position, pending map[string]PendingOrder, st lipgloss.Style, w int) string {
+	// Inner content width = panel width minus border (2) and padding (2)
+	innerW := w - 4
+	if innerW < 24 {
+		innerW = 24
+	}
+
 	var acctLabel string
 	if label == "MASTER" {
 		acctLabel = styleBlue.Render("⬟ MASTER") + "  " + styleLabel.Render("#"+c.accountID)
@@ -2172,8 +2319,14 @@ func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, posi
 		acctLabel = styleAmber.Render("⬟ SLAVE") + "   " + styleLabel.Render("#"+c.accountID)
 	}
 
+	// Truncate account name to fit
+	nameStr := c.accountName
+	if lipgloss.Width(nameStr) > innerW {
+		nameStr = truncate(nameStr, innerW)
+	}
+
 	var lines []string
-	lines = append(lines, acctLabel, styleDim.Render(c.accountName), "")
+	lines = append(lines, acctLabel, styleDim.Render(nameStr), "")
 
 	if bal != nil {
 		pnl := bal.Profit
@@ -2182,55 +2335,113 @@ func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, posi
 			pnlStyled = styleRed.Render(pnl)
 		}
 		lines = append(lines,
-			styleLabel.Render("Balance  ")+styleBold.Render(bal.Balance+" "+bal.Currency),
-			styleLabel.Render("Equity   ")+styleBold.Render(bal.Equity)+"   "+styleLabel.Render("P&L ")+pnlStyled,
-			styleLabel.Render("Margin   ")+styleDim.Render(bal.FreeMargin+" free"),
+			truncate(styleLabel.Render("Balance  ")+styleBold.Render(bal.Balance+" "+bal.Currency), innerW),
+			truncate(styleLabel.Render("Equity   ")+styleBold.Render(bal.Equity)+"   "+styleLabel.Render("P&L ")+pnlStyled, innerW),
+			truncate(styleLabel.Render("Margin   ")+styleDim.Render(bal.FreeMargin+" free"), innerW),
 			"",
 		)
 	}
 
+	// Calculate column widths dynamically for position/pending tables
+	// Available data area: 2 char prefix + columns + spaces between columns
+	// Minimum viable column widths
+	minSym := 4
+	minSide := 3
+	minVol := 5
+	minPrice := 5
+	minPnl := 5
+	colGaps := 4 // spaces between 5 columns
+	dataW := innerW - 2 // subtract "  " prefix
+
+	// Distribute available width across columns
+	symW, sideW, volW, priceW, pnlW := distCols(dataW, colGaps, minSym, minSide, minVol, minPrice, minPnl,
+		// weight factors: symbol and P&L get more space
+		2, 1, 1, 1, 2)
+
+	// Pending orders use symbol + type+side + volume + price
+	pendSymW, pendSSW, pendVolW, pendPriceW := pendColWidths(dataW, minSym, minSide, minVol, minPrice)
+
 	if len(positions) == 0 {
-		lines = append(lines, styleDim.Render("  — no open positions —"))
+		lines = append(lines, styleDim.Render(truncate("  — no open positions —", innerW)))
 	} else {
-		lines = append(lines, styleDim.Render(fmt.Sprintf("  %-8s %-5s %-7s %-10s %-9s", "Symbol", "Side", "Vol", "Open@", "P&L")))
+		posHdr := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s",
+			symW, "Symbol", sideW, "Side", volW, "Vol", priceW, "Open@", pnlW, "P&L")
+		lines = append(lines, styleDim.Render(truncate(posHdr, innerW)))
 		for _, p := range positions {
-			sideStr := styleGreen.Render(fmt.Sprintf("%-5s", p.Side))
+			sideStr := styleGreen.Render(fmt.Sprintf("%-*s", sideW, p.Side))
 			if p.Side == "SELL" {
-				sideStr = styleRed.Render(fmt.Sprintf("%-5s", p.Side))
+				sideStr = styleRed.Render(fmt.Sprintf("%-*s", sideW, p.Side))
 			}
 			pnl := p.Profit
-			pnlStr := styleGreen.Render(fmt.Sprintf("%-9s", pnl))
+			pnlStr := styleGreen.Render(fmt.Sprintf("%-*s", pnlW, pnl))
 			if v, err := strconv.ParseFloat(pnl, 64); err == nil && v < 0 {
-				pnlStr = styleRed.Render(fmt.Sprintf("%-9s", pnl))
+				pnlStr = styleRed.Render(fmt.Sprintf("%-*s", pnlW, pnl))
 			}
-			lines = append(lines, fmt.Sprintf("  %-8s %s %-7s %-10s %s",
-				styleValue.Render(fmt.Sprintf("%-8s", p.Symbol)),
-				sideStr, p.Volume,
-				styleDim.Render(fmt.Sprintf("%-10s", p.OpenPrice)),
+			row := fmt.Sprintf("  %-*s %s %-*s %-*s %s",
+				symW, truncate(p.Symbol, symW),
+				sideStr, volW, p.Volume,
+				priceW, truncate(p.OpenPrice, priceW),
 				pnlStr,
-			))
+			)
+			lines = append(lines, truncate(row, innerW))
 		}
 	}
 
 	// Pending orders section
 	if len(pending) > 0 {
-		lines = append(lines, "", styleDim.Render(fmt.Sprintf("  ⏳ %d pending order(s):", len(pending))))
-		lines = append(lines, styleDim.Render(fmt.Sprintf("  %-8s %-5s %-7s %-10s", "Symbol", "Side", "Vol", "Trigger@")))
+		pendHdr := fmt.Sprintf("  %-*s %-*s %-*s %-*s",
+			pendSymW, "Symbol", pendSSW, "Side", pendVolW, "Vol", pendPriceW, "Trigger@")
+		lines = append(lines, "",
+			truncate(styleDim.Render(fmt.Sprintf("  ⏳ %d pending", len(pending))), innerW),
+			styleDim.Render(truncate(pendHdr, innerW)))
 		for _, po := range pending {
-			sideStr := styleGreen.Render(fmt.Sprintf("%-5s", po.Side))
+			sideStr := styleGreen.Render(fmt.Sprintf("%-*s", minSide, po.Side))
 			if po.Side == "SELL" {
-				sideStr = styleRed.Render(fmt.Sprintf("%-5s", po.Side))
+				sideStr = styleRed.Render(fmt.Sprintf("%-*s", minSide, po.Side))
 			}
-			typeStr := styleAmber.Render(fmt.Sprintf("%-4s", po.Type))
-			lines = append(lines, fmt.Sprintf("  %s %s%s %-7s %-10s",
-				styleValue.Render(fmt.Sprintf("%-8s", po.Symbol)),
-				typeStr, sideStr, po.Volume,
-				styleDim.Render(fmt.Sprintf("%-10s", po.ActivationPrice)),
-			))
+			typeStr := styleAmber.Render(fmt.Sprintf("%-*s", minSide, po.Type))
+			row := fmt.Sprintf("  %-*s %s%s %-*s %-*s",
+				pendSymW, truncate(po.Symbol, pendSymW),
+				typeStr, sideStr,
+				pendVolW, po.Volume,
+				pendPriceW, truncate(po.ActivationPrice, pendPriceW),
+			)
+			lines = append(lines, truncate(row, innerW))
 		}
 	}
 
-	return st.Width(w).Render(strings.Join(lines, "\n"))
+	return st.MaxWidth(w).Render(strings.Join(lines, "\n"))
+}
+
+// distCols distributes available width across 5 columns with given min widths and weights.
+func distCols(avail, gaps, min1, min2, min3, min4, min5 int, w1, w2, w3, w4, w5 int) (int, int, int, int, int) {
+	mins := min1 + min2 + min3 + min4 + min5 + gaps
+	if avail <= mins {
+		return min1, min2, min3, min4, min5
+	}
+	extra := avail - mins
+	totalW := w1 + w2 + w3 + w4 + w5
+	return min1 + extra*w1/totalW,
+		min2 + extra*w2/totalW,
+		min3 + extra*w3/totalW,
+		min4 + extra*w4/totalW,
+		min5 + extra*w5/totalW
+}
+
+// pendColWidths distributes available width across 4 pending-order columns.
+func pendColWidths(avail, minSym, minSide, minVol, minPrice int) (int, int, int, int) {
+	// Type+Side combined column needs at least minSide*2
+	ssMin := minSide * 2
+	gaps := 3
+	mins := minSym + ssMin + minVol + minPrice + gaps
+	if avail <= mins {
+		return minSym, ssMin, minVol, minPrice
+	}
+	extra := avail - mins
+	return minSym + extra*2/7,
+		ssMin + extra/7,
+		minVol + extra*2/7,
+		minPrice + extra*2/7
 }
 
 func (m Model) renderLog() string {
