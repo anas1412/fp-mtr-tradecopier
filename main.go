@@ -1040,6 +1040,24 @@ func (m Model) handleAccountsEnter() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// isAccountDisabled returns true if the account at index i should be skipped
+// during slave picking (it is either the master or already selected as a slave).
+func (m Model) isAccountDisabled(i int) bool {
+	if m.pickStep != pickSlave || i >= len(m.accounts) {
+		return false
+	}
+	acc := m.accounts[i]
+	if acc.TradingAccountID == m.masterID {
+		return true
+	}
+	for _, ps := range m.pendingSlaves {
+		if ps.AccountID == acc.TradingAccountID {
+			return true
+		}
+	}
+	return false
+}
+
 func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// In pickSlave mode, the cursor can go up to len(accounts) (the "Done" option)
 	// except during edit mode where we only pick one slave at a time
@@ -1053,11 +1071,27 @@ func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "up", "k":
 		if m.cursor > 0 {
+			orig := m.cursor
 			m.cursor--
+			// Skip disabled accounts during slave picking
+			for m.cursor >= 0 && m.isAccountDisabled(m.cursor) {
+				m.cursor--
+			}
+			if m.cursor < 0 {
+				m.cursor = orig // nowhere to go, stay put
+			}
 		}
 	case "down", "j":
 		if m.cursor < maxCursor {
+			orig := m.cursor
 			m.cursor++
+			// Skip disabled accounts during slave picking
+			for m.cursor < len(m.accounts) && m.isAccountDisabled(m.cursor) {
+				m.cursor++
+			}
+			if m.cursor > maxCursor {
+				m.cursor = orig // nowhere to go, stay put
+			}
 		}
 	case "enter", " ":
 		return m.handleAccountsEnter()
@@ -1535,6 +1569,26 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Populate stats immediately so the first render shows real data
+		if masterBal, err := m.master.GetBalance(); err == nil {
+			m.stats.masterBalance = masterBal
+		}
+		m.stats.masterPos = pos
+		m.stats.masterPending = pendingOrders
+		if err == nil {
+			m.stats.masterPending = pendingOrders
+		}
+		m.stats.lastPoll = time.Now()
+		// Pre-fetch slave balances too
+		for _, sc := range m.slaves {
+			bal, err := sc.client.GetBalance()
+			if err == nil {
+				sc.balance = bal
+			}
+			spos, _ := sc.client.GetOpenPositions()
+			sc.positions = spos
+		}
+
 		if len(slaveErrs) > 0 {
 			return msgSeedDone{err: fmt.Errorf("slave errors: %s", strings.Join(slaveErrs, "; "))}
 		}
@@ -2003,10 +2057,15 @@ func (m Model) viewAccounts() string {
 			nameW = 5
 		}
 	}
+
+	// Build display rows — skip master and already-picked accounts during slave picking
 	var rows []string
+	displayIdx := 0 // visible index (skipping disabled items)
+	doneIdx := -1
 	for i, acc := range m.accounts {
 		isMaster := acc.TradingAccountID == m.masterID
 		isPicked := pickedIDs[acc.TradingAccountID]
+		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
 
 		name := acc.Offer.Description
 		if name == "" {
@@ -2017,42 +2076,44 @@ func (m Model) viewAccounts() string {
 			acctType = "LIVE"
 		}
 
-		tags := ""
-		if isMaster {
-			tags = truncate(styleMasterTag.Render(" MASTER "), nameW/2)
-		}
-		if isPicked {
-			tags = truncate(styleSlaveTag.Render(" SLAVE "), nameW/2)
+		if isMaster && m.pickStep == pickSlave {
+			// Show master above the list as info, not in scrollable rows
+			line := fmt.Sprintf("  ▶  #%-*s  %-*s  %-*s  [%s]",
+				idW, truncate(acc.TradingAccountID, idW),
+				curW, truncate(acc.Offer.Currency, curW),
+				nameW, truncate(name, nameW),
+				acctType)
+			rows = append(rows, styleDim.Render(line)+"  "+styleMasterTag.Render(" SOURCE "))
+			continue
 		}
 
-		// Dim accounts that are master or already picked (during slave pick)
-		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
+		if isDisabled {
+			// Already-picked slaves — skip entirely during slave picking
+			continue
+		}
 
-		line := fmt.Sprintf("  #%-*s  %-*s  %-*s  [%s]%s",
+		line := fmt.Sprintf("  #%-*s  %-*s  %-*s  [%s]",
 			idW, truncate(acc.TradingAccountID, idW),
 			curW, truncate(acc.Offer.Currency, curW),
 			nameW, truncate(name, nameW),
 			acctType,
-			tags,
 		)
 
 		var row string
-		if isDisabled {
-			row = styleDim.Render(line + "  (already selected)")
-		} else if i == m.cursor {
+		if i == m.cursor {
 			row = styleAccountRowFocused.Render(line)
-		} else if isMaster || isPicked {
-			row = styleAccountRowSelected.Render(line)
 		} else {
 			row = styleAccountRow.Render(line)
 		}
 		rows = append(rows, row)
+		displayIdx++
 	}
 
 	// Add "Done" option at the bottom in pickSlave mode (but not during edit)
 	if m.pickStep == pickSlave && !m.editMode {
+		doneIdx = len(m.accounts) // "Done" index = one past last account
 		doneLabel := "  ✓  Done selecting slaves"
-		if m.cursor == len(m.accounts) {
+		if m.cursor == doneIdx {
 			rows = append(rows, styleAccountRowFocused.Render(doneLabel))
 		} else {
 			rows = append(rows, styleAccountRow.Render(doneLabel))
@@ -2213,8 +2274,13 @@ func (m Model) viewCopying() string {
 			panels += "\n\n" + sp
 		}
 	} else {
-		panels = lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, strings.Repeat(" ", gap))
-		panels += lipgloss.JoinHorizontal(lipgloss.Top, slavePanels...)
+		// All panels side-by-side with gaps between
+		all := make([]string, 0, nPanels*2-1)
+		all = append(all, masterPanel)
+		for _, sp := range slavePanels {
+			all = append(all, strings.Repeat(" ", gap), sp)
+		}
+		panels = lipgloss.JoinHorizontal(lipgloss.Top, all...)
 	}
 
 	// Log
