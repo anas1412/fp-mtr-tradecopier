@@ -678,6 +678,10 @@ type Model struct {
 	pollMs       int           // poll interval in ms (from config or default)
 	settingsInput textinput.Model
 
+	// Account verification for edit "Add slave" — filters out expired accounts
+	verifyingAccts bool
+	verifiedAccts  map[string]bool
+
 	// Notifications
 	notifier *Notifier
 
@@ -765,10 +769,11 @@ func newModel() Model {
 // Messages
 // ────────────────────────────────────────────────────────────────────────────
 
-type msgLoginDone   struct{ accounts []APIAccount; err error }
-type msgSeedDone    struct{ count int; err error }
-type msgPollTick    struct{}
-type msgEditApplied struct{ err error }
+type msgLoginDone     struct{ accounts []APIAccount; err error }
+type msgSeedDone      struct{ count int; err error }
+type msgPollTick      struct{}
+type msgEditApplied   struct{ err error }
+type msgAcctsVerified struct{ valid map[string]bool }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Init
@@ -928,6 +933,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.log(LogErr, msg.err.Error())
 		}
 		cmds = append(cmds, m.cmdSchedulePoll())
+
+	case msgAcctsVerified:
+		m.verifyingAccts = false
+		m.verifiedAccts = msg.valid
+		m.screen = screenAccounts
+		m.cursor = 0
 	}
 
 	return m, tea.Batch(cmds...)
@@ -1207,14 +1218,40 @@ func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.multInput.Focus()
 		}
 	case "enter", " ":
-		// "Add slave" option
+		// "Add slave" option — verify accounts first to filter out expired ones
 		if m.cursor == len(m.pendingSlaves) {
 			m.editMode = true
 			m.pickStep = pickSlave
 			m.slaveID = ""
 			m.cursor = 0
-			m.screen = screenAccounts
-			return m, nil
+			m.verifyingAccts = true
+			m.verifiedAccts = nil
+			return m, func() tea.Msg {
+				valid := make(map[string]bool)
+				for _, acc := range m.accounts {
+					if acc.TradingAccountID == m.masterID {
+						continue // skip master
+					}
+					isPicked := false
+					for _, ps := range m.pendingSlaves {
+						if ps.AccountID == acc.TradingAccountID {
+							isPicked = true
+							break
+						}
+					}
+					if isPicked {
+						continue // skip already-configured slaves
+					}
+					// Try to verify — use the token from the login response
+					c := &Client{http: m.sharedJar.http, browserID: m.browserID}
+					c.tradingApiToken = acc.TradingApiToken
+					c.accountID = acc.TradingAccountID
+					if _, err := c.GetBalance(); err == nil {
+						valid[acc.TradingAccountID] = true
+					}
+				}
+				return msgAcctsVerified{valid}
+			}
 		}
 		// "Apply & restart" option
 		if m.cursor == len(m.pendingSlaves)+1 {
@@ -2041,6 +2078,17 @@ func (m Model) viewAccounts() string {
 			"  " + styleDim.Render("master: ") + styleBlue.Render("#"+m.masterID) + pendingStr
 	}
 
+	// If still verifying accounts (edit "Add slave"), show spinner
+	if m.verifyingAccts {
+		inner := lipgloss.JoinVertical(lipgloss.Left,
+			title, "",
+			stepLabel, "",
+			"  "+m.spinner.View()+styleBlue.Render("  Verifying accounts..."),
+		)
+		inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
+	}
+
 	// Build a set of already-picked slave IDs
 	pickedIDs := make(map[string]bool)
 	for _, ps := range m.pendingSlaves {
@@ -2071,6 +2119,13 @@ func (m Model) viewAccounts() string {
 		isMaster := acc.TradingAccountID == m.masterID
 		isPicked := pickedIDs[acc.TradingAccountID]
 		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
+
+		// In edit "Add slave" mode, skip accounts that failed verification (expired)
+		if m.verifiedAccts != nil && m.pickStep == pickSlave && !isMaster && !isPicked {
+			if !m.verifiedAccts[acc.TradingAccountID] {
+				continue
+			}
+		}
 
 		name := acc.Offer.Description
 		if name == "" {
