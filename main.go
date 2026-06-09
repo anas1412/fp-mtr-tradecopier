@@ -1735,6 +1735,8 @@ func (m Model) View() string {
 		return m.viewCopying()
 	case screenEdit:
 		return m.viewEdit()
+	case screenSettings:
+		return m.viewSettings()
 	}
 	return ""
 }
