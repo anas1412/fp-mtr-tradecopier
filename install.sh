@@ -7,17 +7,24 @@ echo ""
 # Check Go is installed
 if ! command -v go &>/dev/null; then
   echo "Error: Go is not installed."
-  echo "Install it with: sudo pacman -S go"
+  echo ""
+  echo "Install it using your package manager:"
+  echo "  macOS:    brew install go"
+  echo "  Ubuntu:   sudo apt install golang-go"
+  echo "  Arch:     sudo pacman -S go"
+  echo "  Fedora:   sudo dnf install golang"
+  echo ""
+  echo "Or download from: https://go.dev/dl/"
   exit 1
 fi
 
 GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
 echo "Go version: $GO_VERSION"
 
-# Download deps
+# Fetch dependencies
 echo ""
 echo "==> Fetching dependencies..."
-GONOSUMDB="*" GOFLAGS="-mod=mod" go mod tidy
+go mod tidy
 
 # Build
 echo ""

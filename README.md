@@ -1,74 +1,89 @@
 # FundingPips Trade Copier
 
-Copies trades from a master account to a slave account on FundingPips MatchTrader platform.
+Copies trades from a master account to a slave account on the FundingPips MatchTrader platform.
 
-## Setup
+## Quick Install
 
-### 1. Install dependencies
+**Prerequisite:** [Go](https://go.dev/dl/) 1.22+
+
 ```bash
-cd fundingpips-copier
-go mod tidy
+git clone git@github.com:anas1412/fp-mtr-tradecopier.git
+cd fp-mtr-tradecopier
+bash install.sh
 ```
 
-### 2. Edit config
-```bash
-nano config.yaml
-```
-Fill in your master and slave account credentials. Both accounts must be on the same FundingPips email or different emails — both work as long as they are valid FundingPips MatchTrader accounts.
+This fetches dependencies and builds the `copier` binary.
 
-### 3. Build
-```bash
-go build -o copier .
-```
+## Usage
 
-### 4. Run
 ```bash
 ./copier
-# or with a custom config path:
-./copier /path/to/config.yaml
 ```
 
-### 5. Run as systemd service (autostart on login)
-```bash
-# Create the directory
-mkdir -p ~/.local/bin/fundingpips-copier
+A terminal UI will guide you through:
 
-# Copy binary and files
-cp copier ~/.local/bin/fundingpips-copier/
-cp config.yaml ~/.local/bin/fundingpips-copier/
+1. **Login** — enter your FundingPips email and password
+2. **Select master** — the account to copy trades **from**
+3. **Select slave** — the account to copy trades **to**
+4. **Set multiplier** — scale the lot size (1.0 = same, 0.5 = half, 2.0 = double)
+5. **Copying** — live copier running, showing positions and activity log
 
-# Install the service
-mkdir -p ~/.config/systemd/user
-cp fundingpips-copier.service ~/.config/systemd/user/
+Credentials are saved to `copier-config.json` so you don't need to re-enter them next time. Press `l` during copying to log out and clear saved credentials.
 
-# Enable and start
-systemctl --user daemon-reload
-systemctl --user enable fundingpips-copier
-systemctl --user start fundingpips-copier
+### Controls
 
-# Watch logs live
-journalctl --user -u fundingpips-copier -f
-```
+| Key | Action |
+|---|---|
+| `Tab` / `↑↓` | Navigate between fields |
+| `Enter` / `Space` | Confirm / select |
+| `Esc` / `b` | Go back |
+| `q` | Quit |
+| `l` | Logout (clear saved credentials) |
 
 ## How it works
 
 1. Logs into both accounts on startup
-2. Seeds existing master positions (so they are NOT copied — only new ones are)
-3. Polls master account every 500ms (configurable)
-4. When a new position appears on master → opens same position on slave (with lot multiplier applied)
+2. Seeds existing master positions (so they are **not** copied — only new ones are)
+3. Polls master account every 200ms
+4. When a new position appears on master → opens the same position on slave (with lot multiplier applied)
 5. When a position closes on master → finds matching position on slave and closes it
+6. Both master and slave accounts can be on the same FundingPips email or different ones
 
-## Config options
+## Autostart (systemd)
 
-| Field | Description |
-|---|---|
-| `lot_multiplier` | Scale slave lot size. `1.0` = same, `0.5` = half, `2.0` = double |
-| `poll_interval_ms` | How often to check master positions in milliseconds |
-| `system_uuid` | FundingPips MatchTrader system UUID (hardcoded, no need to change) |
-| `broker_id` | FundingPips broker ID (hardcoded as `"1"`, no need to change) |
+```bash
+bash install.sh
+mkdir -p ~/.local/bin/fundingpips-copier
+cp copier ~/.local/bin/fundingpips-copier/
+```
+
+Create `~/.config/systemd/user/fundingpips-copier.service`:
+
+```ini
+[Unit]
+Description=FundingPips Trade Copier
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/fundingpips-copier/copier
+WorkingDirectory=%h/.local/bin/fundingpips-copier
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable fundingpips-copier
+systemctl --user start fundingpips-copier
+journalctl --user -u fundingpips-copier -f
+```
 
 ## Notes
 
-- The copier does NOT copy pre-existing positions when it starts — only new ones opened after the copier is running
-- If the slave account has multiple open positions in the same symbol/direction, the close logic will close the first match
+- Pre-existing positions are **not** copied on startup — only new ones opened while the copier is running
+- If the slave has multiple open positions on the same symbol/direction, the close logic matches the first one found
 - Tokens from the login response are long-lived JWTs — no refresh needed
