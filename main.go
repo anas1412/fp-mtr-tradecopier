@@ -1723,6 +1723,35 @@ func (m *Model) doPoll() {
 // Views
 // ────────────────────────────────────────────────────────────────────────────
 
+// contentW returns the usable content width (terminal or a reasonable default).
+func (m Model) contentW() int {
+	if m.width > 20 {
+		return m.width - 4
+	}
+	return 76 // fallback for unknown terminal
+}
+
+// truncate shortens s to fit within maxW terminal cells, appending "…" if cut.
+func truncate(s string, maxW int) string {
+	w := lipgloss.Width(s)
+	if w <= maxW {
+		return s
+	}
+	// Walk runes and build truncated string
+	var out []rune
+	runes := []rune(s)
+	cur := 0
+	for _, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if cur+rw > maxW-1 {
+			break
+		}
+		out = append(out, r)
+		cur += rw
+	}
+	return string(out) + "…"
+}
+
 func (m Model) View() string {
 	switch m.screen {
 	case screenLogin:
@@ -1788,7 +1817,8 @@ func (m Model) viewLogin() string {
 		errLine, status,
 		"", help,
 	)
-
+	// Constrain to terminal width
+	inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
@@ -1818,6 +1848,21 @@ func (m Model) viewAccounts() string {
 		pickedIDs[ps.AccountID] = true
 	}
 
+	// Determine column widths from terminal width
+	rowW := m.contentW() - 6  // panel border (4) + small padding
+	idW := 10
+	curW := 8
+	typeW := 6
+	nameW := rowW - idW - curW - typeW - 8 // 8 for "  " + "  " + " [" + "]" + extras
+	if nameW < 10 {
+		// Very narrow terminal — shrink ID and currency
+		idW = 6
+		curW = 4
+		nameW = rowW - idW - curW - typeW - 8
+		if nameW < 5 {
+			nameW = 5
+		}
+	}
 	var rows []string
 	for i, acc := range m.accounts {
 		isMaster := acc.TradingAccountID == m.masterID
@@ -1834,19 +1879,19 @@ func (m Model) viewAccounts() string {
 
 		tags := ""
 		if isMaster {
-			tags = "  " + styleMasterTag.Render(" MASTER ")
+			tags = truncate(styleMasterTag.Render(" MASTER "), nameW/2)
 		}
 		if isPicked {
-			tags = "  " + styleSlaveTag.Render(" SLAVE ")
+			tags = truncate(styleSlaveTag.Render(" SLAVE "), nameW/2)
 		}
 
 		// Dim accounts that are master or already picked (during slave pick)
 		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
 
-		line := fmt.Sprintf("  #%-10s  %-8s  %-30s  [%s]%s",
-			acc.TradingAccountID,
-			acc.Offer.Currency,
-			name,
+		line := fmt.Sprintf("  #%-*s  %-*s  %-*s  [%s]%s",
+			idW, truncate(acc.TradingAccountID, idW),
+			curW, truncate(acc.Offer.Currency, curW),
+			nameW, truncate(name, nameW),
 			acctType,
 			tags,
 		)
@@ -1884,7 +1929,7 @@ func (m Model) viewAccounts() string {
 		list,
 		"", help,
 	)
-
+	inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
@@ -1940,7 +1985,7 @@ func (m Model) viewMultiplier() string {
 		btn,
 		"", help,
 	)
-
+	inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
@@ -1979,7 +2024,7 @@ func (m Model) viewCopying() string {
 		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, sc.pendingKnown, stylePanelSlave, panelW))
 	}
 
-	// Header
+	// Header — constrain to terminal width
 	pollAge := ""
 	if !lastPoll.IsZero() {
 		ms := time.Since(lastPoll).Milliseconds()
@@ -1991,21 +2036,31 @@ func (m Model) viewCopying() string {
 		statusBadge = styleBadgeAmber.Render("  ⏸ PAUSED  ")
 		statusText = ""
 	}
+	titleW := m.contentW() - lipgloss.Width(statusBadge) - lipgloss.Width(statusText) - 4
+	if titleW < 30 {
+		titleW = 30
+	}
+	title := styleTitle.MaxWidth(titleW).Render("  ◈  FundingPips Trade Copier  ")
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
-		styleTitle.Render("  ◈  FundingPips Trade Copier  "),
+		title,
 		"  ", statusBadge, statusText,
 	)
 
-	// Stats
+	// Stats — compact for narrow terminals
 	cpBadge := styleBadgeGreen.Render(fmt.Sprintf(" ✓ %d copied ", totalCopied))
 	clBadge := styleBadgeAmber.Render(fmt.Sprintf(" ⊘ %d closed ", totalClosed))
 	pcBadge := styleBadgeGreen.Render(fmt.Sprintf(" ⟳ %d pend copied ", totalPendCopied))
 	pdBadge := styleBadgeAmber.Render(fmt.Sprintf(" ✕ %d pend cancelled ", totalPendCancelled))
-	errBadge := styleDim.Render("")
+	statsW := m.contentW()
+	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", pcBadge, "  ", pdBadge)
 	if totalErrors > 0 {
-		errBadge = styleBadgeRed.Render(fmt.Sprintf(" ✗ %d errors ", totalErrors))
+		errBadge := styleBadgeRed.Render(fmt.Sprintf(" ✗ %d errors ", totalErrors))
+		statsBar = lipgloss.JoinHorizontal(lipgloss.Top, statsBar, "  ", errBadge)
 	}
-	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", pcBadge, "  ", pdBadge, "  ", errBadge)
+	// Truncate stats if still too wide
+	if lipgloss.Width(statsBar) > statsW {
+		statsBar = truncate(statsBar, statsW)
+	}
 
 	masterPanel := m.renderAccount("MASTER", m.master, masterBal, masterPos, pendingMap(masterPending), stylePanelMaster, panelW)
 
@@ -2046,12 +2101,14 @@ func (m Model) viewSettings() string {
 	note := styleDim.Render("  Lower = faster copy, but may hit rate limits. Min 50ms.")
 	footer := styleDim.Render("  enter  save    esc/b  back")
 
-	return lipgloss.JoinVertical(lipgloss.Left,
+	inner := lipgloss.JoinVertical(lipgloss.Left,
 		title, "",
 		line, "",
 		note, "",
 		footer,
 	)
+	inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
 func (m Model) viewEdit() string {
@@ -2060,13 +2117,16 @@ func (m Model) viewEdit() string {
 	masterLine := styleBlue.Render("⬟ MASTER") + "  " + styleLabel.Render("#"+m.masterID)
 
 	var rows []string
-	rows = append(rows, "  "+masterLine, "")
+	maxW := m.contentW() - 6
+	rows = append(rows, "  "+truncate(masterLine, maxW), "")
 
 	if len(m.pendingSlaves) == 0 {
 		rows = append(rows, styleDim.Render("  — no slaves configured —"))
 	} else {
 		for i, ps := range m.pendingSlaves {
-			line := fmt.Sprintf("  SLAVE %d:  #%-10s  ×%.2f", i+1, ps.AccountID, ps.Multiplier)
+			line := fmt.Sprintf("  SLAVE %d:  #%-*s  ×%.2f", i+1,
+				min(10, maxW-20), truncate(ps.AccountID, min(10, maxW-20)),
+				ps.Multiplier)
 			if i == m.cursor {
 				rows = append(rows, styleAccountRowFocused.Render(line))
 			} else {
@@ -2100,7 +2160,7 @@ func (m Model) viewEdit() string {
 		list,
 		"", help,
 	)
-
+	inner = lipgloss.NewStyle().MaxWidth(m.contentW()).Render(inner)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
