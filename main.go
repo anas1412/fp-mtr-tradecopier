@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,16 +21,28 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// newUUIDv4 generates a random UUID v4 string (no external deps).
+func newUUIDv4() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	// Set version 4
+	b[6] = (b[6] & 0x0f) | 0x40
+	// Set variant bits
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Constants
 // ────────────────────────────────────────────────────────────────────────────
 
 const (
-	baseURL    = "https://mtr-platform.fundingpips.com"
-	brokerID   = "1"
-	systemUUID = "beedbea9-c757-46ad-b93b-a52ba2c3d648"
-	pollMs     = 200
-	configFile = "copier-config.json"
+	baseURL       = "https://mtr-platform.fundingpips.com"
+	brokerID      = "1"
+	systemUUID    = "beedbea9-c757-46ad-b93b-a52ba2c3d648"
+	defaultPollMs = 500 // safe default; user can tune in settings
+	configFile    = "copier-config.json"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -42,10 +55,12 @@ type SlaveConfig struct {
 }
 
 type SavedConfig struct {
-	Email    string        `json:"email"`
-	Password string        `json:"password"`
-	MasterID string        `json:"master_id"`
-	Slaves   []SlaveConfig `json:"slaves"`
+	Email     string        `json:"email"`
+	Password  string        `json:"password"`
+	MasterID  string        `json:"master_id"`
+	Slaves    []SlaveConfig `json:"slaves"`
+	BrowserID string        `json:"browser_id"`
+	PollMs    int           `json:"poll_ms"`
 }
 
 // savedConfigMigrate embeds SavedConfig and adds the old single-slave fields
@@ -270,6 +285,44 @@ type ClosePositionRequest struct {
 	Volume     string `json:"volume"`
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Pending Order Types
+// ────────────────────────────────────────────────────────────────────────────
+
+type ActiveOrdersResponse struct {
+	Orders []PendingOrder `json:"orders"`
+}
+
+type PendingOrder struct {
+	ID              string `json:"id"`
+	Symbol          string `json:"symbol"`
+	Type            string `json:"type"`
+	Side            string `json:"side"`
+	Volume          string `json:"volume"`
+	ActivationPrice string `json:"activationPrice"`
+	CreationTime    string `json:"creationTime"`
+	StopLoss        string `json:"stopLoss"`
+	TakeProfit      string `json:"takeProfit"`
+}
+
+type CreatePendingOrderRequest struct {
+	Instrument string  `json:"instrument"`
+	OrderSide  string  `json:"orderSide"`
+	Volume     float64 `json:"volume"`
+	Type       string  `json:"type"`
+	Price      float64 `json:"price"`
+	SlPrice    float64 `json:"slPrice"`
+	TpPrice    float64 `json:"tpPrice"`
+	IsMobile   bool    `json:"isMobile"`
+}
+
+type CancelPendingOrderRequest struct {
+	ID         string `json:"id"`
+	Instrument string `json:"instrument"`
+	OrderSide  string `json:"orderSide"`
+	Type       string `json:"type"`
+}
+
 type APIResponse struct {
 	Status       string `json:"status"`
 	ErrorMessage string `json:"errorMessage"`
@@ -292,6 +345,7 @@ type Client struct {
 	tradingApiToken string
 	accountID       string
 	accountName     string
+	browserID       string
 }
 
 func NewClient() *Client {
@@ -301,7 +355,7 @@ func NewClient() *Client {
 
 // browserHeaders sets headers that match what the MatchTrader web app sends,
 // required to pass Cloudflare's bot detection.
-func browserHeaders(req *http.Request) {
+func browserHeaders(req *http.Request, browserID string) {
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
@@ -313,6 +367,10 @@ func browserHeaders(req *http.Request) {
 	req.Header.Set("Sec-Fetch-Dest", "empty")
 	req.Header.Set("Sec-Fetch-Mode", "cors")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	// Stable browser fingerprint — same ID every time = looks like one real browser
+	if browserID != "" {
+		req.Header.Set("X-Browser-Id", browserID)
+	}
 }
 
 // LoginAll logs in and returns ALL accounts (used for selection screen)
@@ -323,7 +381,7 @@ func (c *Client) LoginAll(email, password string) ([]APIAccount, error) {
 		return nil, fmt.Errorf("request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	browserHeaders(req)
+	browserHeaders(req, c.browserID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -372,7 +430,7 @@ func (c *Client) do(method, path string, body interface{}) (*http.Response, erro
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Auth-trading-api", c.tradingApiToken)
-	browserHeaders(req)
+	browserHeaders(req, c.browserID)
 	return c.http.Do(req)
 }
 
@@ -439,6 +497,60 @@ func (c *Client) ClosePosition(p Position) error {
 	return nil
 }
 
+func (c *Client) GetActiveOrders() ([]PendingOrder, error) {
+	resp, err := c.do("GET", "/mtr-api/"+systemUUID+"/active-orders", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("unauthorized (session expired)")
+	}
+	var r ActiveOrdersResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, err
+	}
+	return r.Orders, nil
+}
+
+func (c *Client) CreatePendingOrder(p PendingOrder, multiplier float64) error {
+	vol, _ := strconv.ParseFloat(p.Volume, 64)
+	sl, _ := strconv.ParseFloat(p.StopLoss, 64)
+	tp, _ := strconv.ParseFloat(p.TakeProfit, 64)
+	price, _ := strconv.ParseFloat(p.ActivationPrice, 64)
+	vol = math.Round(vol*multiplier*100) / 100
+	resp, err := c.do("POST", "/mtr-api/"+systemUUID+"/pending-order/create", CreatePendingOrderRequest{
+		Instrument: p.Symbol, OrderSide: p.Side, Volume: vol,
+		Type: p.Type, Price: price, SlPrice: sl, TpPrice: tp, IsMobile: false,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var ar APIResponse
+	json.NewDecoder(resp.Body).Decode(&ar)
+	if ar.Status != "OK" {
+		return fmt.Errorf("%s", ar.ErrorMessage)
+	}
+	return nil
+}
+
+func (c *Client) CancelPendingOrder(p PendingOrder) error {
+	resp, err := c.do("POST", "/mtr-api/"+systemUUID+"/pending-order/cancel", CancelPendingOrderRequest{
+		ID: p.ID, Instrument: p.Symbol, OrderSide: p.Side, Type: p.Type,
+	})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var ar APIResponse
+	json.NewDecoder(resp.Body).Decode(&ar)
+	if ar.Status != "OK" {
+		return fmt.Errorf("%s", ar.ErrorMessage)
+	}
+	return nil
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Log
 // ────────────────────────────────────────────────────────────────────────────
@@ -490,6 +602,7 @@ const (
 	screenMultiplier               // enter lot multiplier
 	screenCopying                 // live copier
 	screenEdit                    // modify slaves after setup
+	screenSettings                // poll interval config
 )
 
 type pickStep int
@@ -512,11 +625,17 @@ type slaveClient struct {
 	copied   int
 	closed   int
 	errors   int
+
+	// Pending order tracking
+	pendingKnown      map[string]PendingOrder
+	pendingCopied     int
+	pendingCancelled  int
 }
 
 type statsData struct {
 	mu            sync.Mutex
 	masterPos     []Position
+	masterPending []PendingOrder
 	masterBalance *BalanceResponse
 	lastPoll      time.Time
 }
@@ -549,12 +668,23 @@ type Model struct {
 	pendingSlaveMult float64
 	editMode         bool // if true, multiplier screen returns to edit instead of accounts
 
+	// Browser fingerprint (stable per install)
+	browserID string
+
+	// Settings
+	pollMs       int           // poll interval in ms (from config or default)
+	settingsInput textinput.Model
+
 	// Copier
 	master *Client
 	slaves []*slaveClient
 	stats  statsData
 	logs   []LogEntry
 	known  map[string]Position
+	paused bool
+
+	// Pending order tracking (master side)
+	pendingKnown map[string]PendingOrder
 }
 
 func newModel() Model {
@@ -579,14 +709,22 @@ func newModel() Model {
 	mult.Width = 20
 	mult.Focus()
 
+	setting := textinput.New()
+	setting.Placeholder = "500"
+	setting.Width = 10
+	setting.CharLimit = 5
+
 	m := Model{
 		screen:        screenLogin,
 		spinner:       sp,
 		emailInput:    email,
 		passInput:     pass,
 		multInput:     mult,
+		settingsInput: setting,
 		known:         make(map[string]Position),
+		pendingKnown:  make(map[string]PendingOrder),
 		pendingSlaves: nil,
+		pollMs:        defaultPollMs,
 	}
 
 	// Pre-fill from saved config if available
@@ -596,6 +734,20 @@ func newModel() Model {
 		if len(cfg.Slaves) > 0 {
 			m.multInput.SetValue(fmt.Sprintf("%.2f", cfg.Slaves[0].Multiplier))
 		}
+		// Generate stable browserId on first ever run
+		if cfg.BrowserID == "" {
+			cfg.BrowserID = newUUIDv4()
+			saveConfig(*cfg)
+		}
+		m.browserID = cfg.BrowserID
+		if cfg.PollMs > 0 {
+			m.pollMs = cfg.PollMs
+		}
+	} else {
+		// No config yet — generate browserId so one exists from the start
+		id := newUUIDv4()
+		m.browserID = id
+		saveConfig(SavedConfig{BrowserID: id, PollMs: defaultPollMs})
 	}
 
 	return m
@@ -645,12 +797,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleMultiplierKey(msg)
 		case screenEdit:
 			return m.handleEditKey(msg)
+		case screenSettings:
+			return m.handleSettingsKey(msg)
 		case screenCopying:
 			switch msg.String() {
 			case "q", "ctrl+c":
 				return m, tea.Quit
 			case "l":
 				return m.logout()
+			case "p":
+				m.paused = !m.paused
+				if m.paused {
+					m.log(LogInfo, "Copier paused")
+				} else {
+					m.log(LogOK, "Copier resumed")
+				}
 			case "e":
 				// Enter edit screen — copy current slaves into pending list
 				m.pendingSlaves = make([]SlaveConfig, len(m.slaves))
@@ -659,6 +820,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.screen = screenEdit
 				m.cursor = 0
+			case "s":
+				m.settingsInput.SetValue(fmt.Sprintf("%d", m.pollMs))
+				m.settingsInput.Focus()
+				m.screen = screenSettings
 			}
 		}
 
@@ -668,6 +833,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loginErr = msg.err.Error()
 		} else {
 			m.accounts = msg.accounts
+			// If saved config exists, verify accounts still valid → skip screens
+			if cfg := loadConfig(); cfg != nil && cfg.MasterID != "" && len(cfg.Slaves) > 0 {
+				m.masterID = cfg.MasterID
+				m.pendingSlaves = cfg.Slaves
+
+				// Verify master still exists in the accounts list
+				masterValid := false
+				for _, a := range msg.accounts {
+					if a.TradingAccountID == cfg.MasterID {
+						masterValid = true
+						break
+					}
+				}
+				// Verify all slaves still exist
+				slavesValid := true
+				for _, s := range cfg.Slaves {
+					found := false
+					for _, a := range msg.accounts {
+						if a.TradingAccountID == s.AccountID {
+							found = true
+							break
+						}
+					}
+					if !found {
+						slavesValid = false
+						break
+					}
+				}
+
+				if masterValid && slavesValid {
+					// All saved accounts are still valid → skip to copying
+					return m.startCopier()
+				}
+				// Some accounts no longer exist → fall through to manual selection
+				m.log(LogErr, "Saved config has invalid accounts — please re-select")
+			}
 			m.screen = screenAccounts
 			m.cursor = 0
 		}
@@ -693,6 +894,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgEditApplied:
 		m.screen = screenCopying
+		m.paused = false
 		if msg.err != nil {
 			m.log(LogErr, msg.err.Error())
 		}
@@ -962,15 +1164,52 @@ func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "esc", "b":
+		// Discard, back to copying
+		m.screen = screenCopying
+		return m, nil
+	case "enter":
+		val := strings.TrimSpace(m.settingsInput.Value())
+		if val == "" {
+			return m, nil
+		}
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 50 {
+			m.settingsInput.SetValue(fmt.Sprintf("%d", m.pollMs))
+			return m, nil
+		}
+		m.pollMs = n
+		// Persist to config
+		cfg := loadConfig()
+		if cfg != nil {
+			cfg.PollMs = n
+			saveConfig(*cfg)
+		} else {
+			saveConfig(SavedConfig{PollMs: n, BrowserID: m.browserID})
+		}
+		m.screen = screenCopying
+		return m, nil
+	default:
+		m.settingsInput, _ = m.settingsInput.Update(msg)
+		return m, nil
+	}
+}
+
 func (m Model) applyEdit() (tea.Model, tea.Cmd) {
 	email := strings.TrimSpace(m.emailInput.Value())
 
 	// Save updated config
 	saveConfig(SavedConfig{
-		Email:    email,
-		Password: m.passInput.Value(),
-		MasterID: m.masterID,
-		Slaves:   m.pendingSlaves,
+		Email:     email,
+		Password:  m.passInput.Value(),
+		MasterID:  m.masterID,
+		Slaves:    m.pendingSlaves,
+		BrowserID: m.browserID,
+		PollMs:    m.pollMs,
 	})
 
 	// Rebuild slave clients
@@ -1050,6 +1289,7 @@ func (m Model) doLogin() (tea.Model, tea.Cmd) {
 	m.connecting = true
 	// Create one shared client that holds the co-auth cookie
 	m.sharedJar = NewClient()
+	m.sharedJar.browserID = m.browserID
 
 	return m, func() tea.Msg {
 		accounts, err := m.sharedJar.LoginAll(email, pass)
@@ -1067,23 +1307,27 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 		slaves = []SlaveConfig{{AccountID: m.slaveID, Multiplier: m.pendingSlaveMult}}
 	}
 	saveConfig(SavedConfig{
-		Email:    email,
-		Password: m.passInput.Value(),
-		MasterID: m.masterID,
-		Slaves:   slaves,
+		Email:     email,
+		Password:  m.passInput.Value(),
+		MasterID:  m.masterID,
+		Slaves:    slaves,
+		BrowserID: m.browserID,
+		PollMs:    m.pollMs,
 	})
 
 	// Master uses the shared jar (co-auth session)
-	m.master = &Client{http: m.sharedJar.http}
+	m.master = &Client{http: m.sharedJar.http, browserID: m.browserID}
+	m.paused = false
 	pass := m.passInput.Value()
 
 	// Create slave clients from pending configs
 	m.slaves = make([]*slaveClient, 0, len(slaves))
 	for _, s := range slaves {
 		sc := &slaveClient{
-			client: &Client{http: m.sharedJar.http},
-			config: s,
-			known:  make(map[string]Position),
+			client:          &Client{http: m.sharedJar.http, browserID: m.browserID},
+			config:          s,
+			known:           make(map[string]Position),
+			pendingKnown:    make(map[string]PendingOrder),
 		}
 		m.slaves = append(m.slaves, sc)
 	}
@@ -1119,6 +1363,17 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 			m.known[p.ID] = p
 			for _, sc := range m.slaves {
 				sc.known[p.ID] = p
+			}
+		}
+
+		// Seed existing master pending orders — so we don't re-copy them
+		pendingOrders, err := m.master.GetActiveOrders()
+		if err == nil {
+			for _, po := range pendingOrders {
+				m.pendingKnown[po.ID] = po
+				for _, sc := range m.slaves {
+					sc.pendingKnown[po.ID] = po
+				}
 			}
 		}
 
@@ -1159,7 +1414,11 @@ func (m Model) cmdSeed() tea.Cmd {
 }
 
 func (m Model) cmdSchedulePoll() tea.Cmd {
-	return tea.Tick(pollMs*time.Millisecond, func(time.Time) tea.Msg {
+	ms := m.pollMs
+	if ms < 50 {
+		ms = 50 // hard floor to avoid actual spam
+	}
+	return tea.Tick(time.Duration(ms)*time.Millisecond, func(time.Time) tea.Msg {
 		return msgPollTick{}
 	})
 }
@@ -1176,8 +1435,16 @@ func posMap(positions []Position) map[string]Position {
 	return m
 }
 
+func pendingMap(orders []PendingOrder) map[string]PendingOrder {
+	m := make(map[string]PendingOrder, len(orders))
+	for _, po := range orders {
+		m[po.ID] = po
+	}
+	return m
+}
+
 func (m *Model) doPoll() {
-	if m.screen != screenCopying {
+	if m.screen != screenCopying || m.paused {
 		return
 	}
 	masterPos, err := m.master.GetOpenPositions()
@@ -1248,14 +1515,73 @@ func (m *Model) doPoll() {
 
 	m.known = current
 
+	// ── Pending order sync ──────────────────────────────────────────────
+	masterPending, err := m.master.GetActiveOrders()
+	if err != nil {
+		m.log(LogErr, "Pending poll: "+err.Error())
+	} else {
+		currentPending := pendingMap(masterPending)
+
+		// New pending orders on master → create on all slaves
+		for id, po := range currentPending {
+			if _, known := m.pendingKnown[id]; !known {
+				side := styleGreen.Render(po.Side)
+				if po.Side == "SELL" {
+					side = styleRed.Render(po.Side)
+				}
+				m.log(LogTrade, fmt.Sprintf("NEW PENDING %s %s  %-7s  vol=%-6s  @ %s",
+					po.Type, side, po.Symbol, po.Volume, po.ActivationPrice))
+
+				for _, sc := range m.slaves {
+					mult := sc.config.Multiplier
+					if err := sc.client.CreatePendingOrder(po, mult); err != nil {
+						sc.errors++
+						m.log(LogErr, fmt.Sprintf("  ↳ slave #%s pending create failed: %s", sc.client.accountID, err.Error()))
+					} else {
+						sc.pendingCopied++
+						scaledVol := po.Volume
+						if v, e2 := strconv.ParseFloat(po.Volume, 64); e2 == nil {
+							scaledVol = fmt.Sprintf("%.2f", math.Round(v*mult*100)/100)
+						}
+						m.log(LogOK, fmt.Sprintf("  ↳ slave #%s pending created  vol=%s ✓", sc.client.accountID, scaledVol))
+					}
+				}
+			}
+		}
+
+		// Cancelled/filled pending orders → cancel on all slaves
+		for id, po := range m.pendingKnown {
+			if _, stillActive := currentPending[id]; !stillActive {
+				m.log(LogTrade, fmt.Sprintf("REMOVED PENDING %s %-6s %-8s → cancelling on slaves...",
+					po.Type, po.Side, po.Symbol))
+				for _, sc := range m.slaves {
+					if err := sc.client.CancelPendingOrder(po); err != nil {
+						sc.errors++
+						m.log(LogErr, fmt.Sprintf("  ↳ slave #%s cancel pending failed: %s", sc.client.accountID, err.Error()))
+					} else {
+						sc.pendingCancelled++
+						m.log(LogOK, fmt.Sprintf("  ↳ slave #%s pending cancelled ✓", sc.client.accountID))
+					}
+				}
+			}
+		}
+
+		m.pendingKnown = currentPending
+	}
+
 	masterBal, _ := m.master.GetBalance()
 	for _, sc := range m.slaves {
 		sc.balance, _ = sc.client.GetBalance()
 		sc.positions, _ = sc.client.GetOpenPositions()
+		// Update slave pending order list too
+		if slavePending, err := sc.client.GetActiveOrders(); err == nil {
+			sc.pendingKnown = pendingMap(slavePending)
+		}
 	}
 
 	m.stats.mu.Lock()
 	m.stats.masterPos = masterPos
+	m.stats.masterPending = masterPending
 	m.stats.masterBalance = masterBal
 	m.stats.lastPoll = time.Now()
 	m.stats.mu.Unlock()
@@ -1487,6 +1813,7 @@ func (m Model) viewMultiplier() string {
 func (m Model) viewCopying() string {
 	m.stats.mu.Lock()
 	masterPos := m.stats.masterPos
+	masterPending := m.stats.masterPending
 	masterBal := m.stats.masterBalance
 	lastPoll := m.stats.lastPoll
 	m.stats.mu.Unlock()
@@ -1494,14 +1821,18 @@ func (m Model) viewCopying() string {
 	// Aggregate stats from all slaves
 	totalCopied := 0
 	totalClosed := 0
+	totalPendCopied := 0
+	totalPendCancelled := 0
 	totalErrors := 0
 	var slavePanels []string
 	for i, sc := range m.slaves {
 		totalCopied += sc.copied
 		totalClosed += sc.closed
+		totalPendCopied += sc.pendingCopied
+		totalPendCancelled += sc.pendingCancelled
 		totalErrors += sc.errors
 		label := fmt.Sprintf("SLAVE %d", i+1)
-		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, stylePanelSlave, 52))
+		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, sc.pendingKnown, stylePanelSlave, 52))
 	}
 
 	// Header
@@ -1510,36 +1841,62 @@ func (m Model) viewCopying() string {
 		ms := time.Since(lastPoll).Milliseconds()
 		pollAge = styleDim.Render(fmt.Sprintf("  ⟳ %dms", ms))
 	}
+	statusBadge := styleBadgeGreen.Render(" LIVE ")
+	statusText := pollAge
+	if m.paused {
+		statusBadge = styleBadgeAmber.Render("  ⏸ PAUSED  ")
+		statusText = ""
+	}
 	header := lipgloss.JoinHorizontal(lipgloss.Center,
 		styleTitle.Render("  ◈  FundingPips Trade Copier  "),
-		"  ", styleBadgeGreen.Render(" LIVE "), pollAge,
+		"  ", statusBadge, statusText,
 	)
 
 	// Stats
 	cpBadge := styleBadgeGreen.Render(fmt.Sprintf(" ✓ %d copied ", totalCopied))
 	clBadge := styleBadgeAmber.Render(fmt.Sprintf(" ⊘ %d closed ", totalClosed))
+	pcBadge := styleBadgeGreen.Render(fmt.Sprintf(" ⟳ %d pend copied ", totalPendCopied))
+	pdBadge := styleBadgeAmber.Render(fmt.Sprintf(" ✕ %d pend cancelled ", totalPendCancelled))
 	errBadge := styleDim.Render("")
 	if totalErrors > 0 {
 		errBadge = styleBadgeRed.Render(fmt.Sprintf(" ✗ %d errors ", totalErrors))
 	}
-	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", errBadge)
+	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", pcBadge, "  ", pdBadge, "  ", errBadge)
 
 	// Account panels
 	panelW := 52
-	masterPanel := m.renderAccount("MASTER", m.master, masterBal, masterPos, stylePanelMaster, panelW)
+	masterPanel := m.renderAccount("MASTER", m.master, masterBal, masterPos, pendingMap(masterPending), stylePanelMaster, panelW)
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, "  ")
 	panels += lipgloss.JoinHorizontal(lipgloss.Top, slavePanels...)
 
 	// Log
 	logView := m.renderLog()
 
-	footer := styleDim.Render("  q  quit    l  logout    e  edit")
+	footer := styleDim.Render("  q  quit    p  pause    l  logout    e  edit    s  settings")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header, "",
 		statsBar, "",
 		panels, "",
 		logView, "",
+		footer,
+	)
+}
+
+func (m Model) viewSettings() string {
+	title := styleTitle.Render("  ◈  Settings  ")
+
+	line := fmt.Sprintf("  %s  %s",
+		styleLabel.Render("Poll interval (ms):"),
+		m.settingsInput.View(),
+	)
+	note := styleDim.Render("  Lower = faster copy, but may hit rate limits. Min 50ms.")
+	footer := styleDim.Render("  enter  save    esc/b  back")
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		title, "",
+		line, "",
+		note, "",
 		footer,
 	)
 }
@@ -1594,7 +1951,7 @@ func (m Model) viewEdit() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
-func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, positions []Position, st lipgloss.Style, w int) string {
+func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, positions []Position, pending map[string]PendingOrder, st lipgloss.Style, w int) string {
 	var acctLabel string
 	if label == "MASTER" {
 		acctLabel = styleBlue.Render("⬟ MASTER") + "  " + styleLabel.Render("#"+c.accountID)
@@ -1638,6 +1995,24 @@ func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, posi
 				sideStr, p.Volume,
 				styleDim.Render(fmt.Sprintf("%-10s", p.OpenPrice)),
 				pnlStr,
+			))
+		}
+	}
+
+	// Pending orders section
+	if len(pending) > 0 {
+		lines = append(lines, "", styleDim.Render(fmt.Sprintf("  ⏳ %d pending order(s):", len(pending))))
+		lines = append(lines, styleDim.Render(fmt.Sprintf("  %-8s %-5s %-7s %-10s", "Symbol", "Side", "Vol", "Trigger@")))
+		for _, po := range pending {
+			sideStr := styleGreen.Render(fmt.Sprintf("%-5s", po.Side))
+			if po.Side == "SELL" {
+				sideStr = styleRed.Render(fmt.Sprintf("%-5s", po.Side))
+			}
+			typeStr := styleAmber.Render(fmt.Sprintf("%-4s", po.Type))
+			lines = append(lines, fmt.Sprintf("  %s %s%s %-7s %-10s",
+				styleValue.Render(fmt.Sprintf("%-8s", po.Symbol)),
+				typeStr, sideStr, po.Volume,
+				styleDim.Render(fmt.Sprintf("%-10s", po.ActivationPrice)),
 			))
 		}
 	}
