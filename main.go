@@ -1505,17 +1505,8 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 	m.paused = false
 	pass := m.passInput.Value()
 
-	// Create slave clients from pending configs
-	m.slaves = make([]*slaveClient, 0, len(slaves))
-	for _, s := range slaves {
-		sc := &slaveClient{
-			client:          &Client{http: m.sharedJar.http, browserID: m.browserID},
-			config:          s,
-			known:           make(map[string]Position),
-			pendingKnown:    make(map[string]PendingOrder),
-		}
-		m.slaves = append(m.slaves, sc)
-	}
+	// Slave clients will be built only for successful logins inside the closure
+	m.slaves = nil
 
 	return m, func() tea.Msg {
 		// Select master from already-logged-in accounts
@@ -1523,25 +1514,35 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 			return msgLoginDone{err: fmt.Errorf("master: %w", err)}
 		}
 
-		// Log in all slaves (use same credentials for each)
+		// Log in all slaves — only keep those that succeed
 		var slaveErrs []string
-		for _, sc := range m.slaves {
+		var validSlaves []*slaveClient
+		for _, s := range slaves {
+			sc := &slaveClient{
+				client:       &Client{http: m.sharedJar.http, browserID: m.browserID},
+				config:       s,
+				known:        make(map[string]Position),
+				pendingKnown: make(map[string]PendingOrder),
+			}
 			slaveAccounts, err := sc.client.LoginAll(email, pass)
 			if err != nil {
-				msg := fmt.Sprintf("slave #%s login: %v", sc.config.AccountID, err)
+				msg := fmt.Sprintf("slave #%s login: %v", s.AccountID, err)
 				slaveErrs = append(slaveErrs, msg)
-				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+				m.notifier.Send("slave_auth_"+s.AccountID, NotifyCritical,
 					"Slave Auth Failed",
-					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
+					fmt.Sprintf("Account #%s: %s", s.AccountID, err.Error()))
 				continue
 			}
-			if err := sc.client.SelectAccount(slaveAccounts, sc.config.AccountID); err != nil {
-				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s select: %v", sc.config.AccountID, err))
-				m.notifier.Send("slave_auth_"+sc.config.AccountID, NotifyCritical,
+			if err := sc.client.SelectAccount(slaveAccounts, s.AccountID); err != nil {
+				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s select: %v", s.AccountID, err))
+				m.notifier.Send("slave_auth_"+s.AccountID, NotifyCritical,
 					"Slave Auth Failed",
-					fmt.Sprintf("Account #%s: %s", sc.config.AccountID, err.Error()))
+					fmt.Sprintf("Account #%s: %s", s.AccountID, err.Error()))
+				continue
 			}
+			validSlaves = append(validSlaves, sc)
 		}
+		m.slaves = validSlaves
 
 		// Seed existing master positions — shared across all slaves
 		pos, err := m.master.GetOpenPositions()
@@ -1574,7 +1575,6 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 			m.stats.masterBalance = masterBal
 		}
 		m.stats.masterPos = pos
-		m.stats.masterPending = pendingOrders
 		if err == nil {
 			m.stats.masterPending = pendingOrders
 		}
@@ -1590,7 +1590,12 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 		}
 
 		if len(slaveErrs) > 0 {
-			return msgSeedDone{err: fmt.Errorf("slave errors: %s", strings.Join(slaveErrs, "; "))}
+			errMsg := fmt.Sprintf("slave errors: %s", strings.Join(slaveErrs, "; "))
+			if len(m.slaves) == 0 {
+				// All slaves failed — don't start the copier
+				return msgLoginDone{err: fmt.Errorf("all slaves failed — %s", errMsg)}
+			}
+			return msgSeedDone{err: fmt.Errorf(errMsg)}
 		}
 		m.notifier.Send("copy_started", NotifyInfo,
 			"Copy Started",
