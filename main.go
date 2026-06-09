@@ -1224,9 +1224,9 @@ func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.applyEdit()
 		}
 	case "esc", "b":
-		// Discard changes, back to copying
+		// Discard changes, back to copying — refresh immediately
 		m.screen = screenCopying
-		return m, nil
+		return m, m.cmdSchedulePoll()
 	}
 	return m, nil
 }
@@ -1236,9 +1236,9 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q":
 		return m, tea.Quit
 	case "esc", "b":
-		// Discard, back to copying
+		// Discard, back to copying — refresh immediately
 		m.screen = screenCopying
-		return m, nil
+		return m, m.cmdSchedulePoll()
 	case "enter":
 		val := strings.TrimSpace(m.settingsInput.Value())
 		if val == "" {
@@ -1259,7 +1259,7 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			saveConfig(SavedConfig{PollMs: n, BrowserID: m.browserID})
 		}
 		m.screen = screenCopying
-		return m, nil
+		return m, m.cmdSchedulePoll()
 	default:
 		m.settingsInput, _ = m.settingsInput.Update(msg)
 		return m, nil
