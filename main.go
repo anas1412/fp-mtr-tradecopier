@@ -36,10 +36,22 @@ const (
 // Saved Config
 // ────────────────────────────────────────────────────────────────────────────
 
+type SlaveConfig struct {
+	AccountID  string  `json:"account_id"`
+	Multiplier float64 `json:"multiplier"`
+}
+
 type SavedConfig struct {
-	Email      string  `json:"email"`
-	Password   string  `json:"password"`
-	MasterID   string  `json:"master_id"`
+	Email    string        `json:"email"`
+	Password string        `json:"password"`
+	MasterID string        `json:"master_id"`
+	Slaves   []SlaveConfig `json:"slaves"`
+}
+
+// savedConfigMigrate embeds SavedConfig and adds the old single-slave fields
+// so we can transparently migrate existing configs.
+type savedConfigMigrate struct {
+	SavedConfig
 	SlaveID    string  `json:"slave_id"`
 	Multiplier float64 `json:"multiplier"`
 }
@@ -49,11 +61,15 @@ func loadConfig() *SavedConfig {
 	if err != nil {
 		return nil
 	}
-	var c SavedConfig
-	if err := json.Unmarshal(data, &c); err != nil {
+	var m savedConfigMigrate
+	if err := json.Unmarshal(data, &m); err != nil {
 		return nil
 	}
-	return &c
+	// Migrate old single-slave format → new multi-slave format
+	if len(m.Slaves) == 0 && m.SlaveID != "" {
+		m.Slaves = []SlaveConfig{{AccountID: m.SlaveID, Multiplier: m.Multiplier}}
+	}
+	return &m.SavedConfig
 }
 
 func saveConfig(c SavedConfig) {
@@ -469,10 +485,11 @@ func (e LogEntry) Render() string {
 type screen int
 
 const (
-	screenLogin    screen = iota // email + password
-	screenAccounts               // pick master then slave
-	screenMultiplier             // enter lot multiplier
-	screenCopying               // live copier
+	screenLogin      screen = iota // email + password
+	screenAccounts                 // pick master then slave(s)
+	screenMultiplier               // enter lot multiplier
+	screenCopying                 // live copier
+	screenEdit                    // modify slaves after setup
 )
 
 type pickStep int
@@ -486,16 +503,22 @@ const (
 // Model
 // ────────────────────────────────────────────────────────────────────────────
 
+type slaveClient struct {
+	client   *Client
+	config   SlaveConfig
+	known    map[string]Position
+	positions []Position
+	balance  *BalanceResponse
+	copied   int
+	closed   int
+	errors   int
+}
+
 type statsData struct {
 	mu            sync.Mutex
 	masterPos     []Position
-	slavePos      []Position
 	masterBalance *BalanceResponse
-	slaveBalance  *BalanceResponse
 	lastPoll      time.Time
-	copied        int
-	closed        int
-	errors        int
 }
 
 type Model struct {
@@ -512,24 +535,26 @@ type Model struct {
 	connecting bool
 
 	// Account selection
-	accounts   []APIAccount
-	cursor     int
-	masterID   string
-	slaveID    string
-	pickStep   pickStep
-	sharedJar  *Client // holds the co-auth cookie for both logins
+	accounts      []APIAccount
+	cursor        int
+	masterID      string
+	slaveID       string          // currently-being-picked slave (before multiplier set)
+	pendingSlaves []SlaveConfig   // fully configured slaves (picked + multiplier set)
+	pickStep      pickStep
+	sharedJar     *Client         // holds the co-auth cookie for both logins
 
 	// Multiplier screen
-	multInput  textinput.Model
-	multErr    string
+	multInput        textinput.Model
+	multErr          string
+	pendingSlaveMult float64
+	editMode         bool // if true, multiplier screen returns to edit instead of accounts
 
 	// Copier
-	master     *Client
-	slave      *Client
-	multiplier float64
-	stats      statsData
-	logs       []LogEntry
-	known      map[string]Position
+	master *Client
+	slaves []*slaveClient
+	stats  statsData
+	logs   []LogEntry
+	known  map[string]Position
 }
 
 func newModel() Model {
@@ -555,19 +580,22 @@ func newModel() Model {
 	mult.Focus()
 
 	m := Model{
-		screen:     screenLogin,
-		spinner:    sp,
-		emailInput: email,
-		passInput:  pass,
-		multInput:  mult,
-		known:      make(map[string]Position),
+		screen:        screenLogin,
+		spinner:       sp,
+		emailInput:    email,
+		passInput:     pass,
+		multInput:     mult,
+		known:         make(map[string]Position),
+		pendingSlaves: nil,
 	}
 
 	// Pre-fill from saved config if available
 	if cfg := loadConfig(); cfg != nil {
 		m.emailInput.SetValue(cfg.Email)
 		m.passInput.SetValue(cfg.Password)
-		m.multInput.SetValue(fmt.Sprintf("%.2f", cfg.Multiplier))
+		if len(cfg.Slaves) > 0 {
+			m.multInput.SetValue(fmt.Sprintf("%.2f", cfg.Slaves[0].Multiplier))
+		}
 	}
 
 	return m
@@ -577,9 +605,10 @@ func newModel() Model {
 // Messages
 // ────────────────────────────────────────────────────────────────────────────
 
-type msgLoginDone  struct{ accounts []APIAccount; err error }
-type msgSeedDone   struct{ count int; err error }
-type msgPollTick   struct{}
+type msgLoginDone   struct{ accounts []APIAccount; err error }
+type msgSeedDone    struct{ count int; err error }
+type msgPollTick    struct{}
+type msgEditApplied struct{ err error }
 
 // ────────────────────────────────────────────────────────────────────────────
 // Init
@@ -614,12 +643,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleAccountsKey(msg)
 		case screenMultiplier:
 			return m.handleMultiplierKey(msg)
+		case screenEdit:
+			return m.handleEditKey(msg)
 		case screenCopying:
 			switch msg.String() {
 			case "q", "ctrl+c":
 				return m, tea.Quit
 			case "l":
 				return m.logout()
+			case "e":
+				// Enter edit screen — copy current slaves into pending list
+				m.pendingSlaves = make([]SlaveConfig, len(m.slaves))
+				for i, sc := range m.slaves {
+					m.pendingSlaves[i] = sc.config
+				}
+				m.screen = screenEdit
+				m.cursor = 0
 			}
 		}
 
@@ -635,8 +674,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgSeedDone:
 		m.screen = screenCopying
-		m.log(LogOK, fmt.Sprintf("Authenticated — master #%s → slave #%s  ×%.2f",
-			m.master.accountID, m.slave.accountID, m.multiplier))
+		var slaveIDs []string
+		for _, sc := range m.slaves {
+			slaveIDs = append(slaveIDs, sc.client.accountID)
+		}
+		m.log(LogOK, fmt.Sprintf("Authenticated — master #%s → %d slave(s): %s",
+			m.master.accountID, len(m.slaves), strings.Join(slaveIDs, ", ")))
 		if msg.err != nil {
 			m.log(LogErr, "Seed error: "+msg.err.Error())
 		} else {
@@ -646,6 +689,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgPollTick:
 		m.doPoll()
+		cmds = append(cmds, m.cmdSchedulePoll())
+
+	case msgEditApplied:
+		m.screen = screenCopying
+		if msg.err != nil {
+			m.log(LogErr, msg.err.Error())
+		}
 		cmds = append(cmds, m.cmdSchedulePoll())
 	}
 
@@ -708,6 +758,13 @@ func (m Model) handleLoginKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// In pickSlave mode, the cursor can go up to len(accounts) (the "Done" option)
+	// except during edit mode where we only pick one slave at a time
+	maxCursor := len(m.accounts) - 1
+	if m.pickStep == pickSlave && !m.editMode {
+		maxCursor = len(m.accounts) // extra slot for "Done"
+	}
+
 	switch msg.String() {
 	case "ctrl+c", "q":
 		return m, tea.Quit
@@ -716,32 +773,74 @@ func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < len(m.accounts)-1 {
+		if m.cursor < maxCursor {
 			m.cursor++
 		}
 	case "enter", " ":
-		selected := m.accounts[m.cursor].TradingAccountID
 		if m.pickStep == pickMaster {
+			selected := m.accounts[m.cursor].TradingAccountID
 			m.masterID = selected
 			m.pickStep = pickSlave
-			// Reset cursor, exclude master from slave selection
 			m.cursor = 0
-			if m.accounts[m.cursor].TradingAccountID == m.masterID && len(m.accounts) > 1 {
+			if m.cursor < len(m.accounts) && m.accounts[m.cursor].TradingAccountID == m.masterID && len(m.accounts) > 1 {
 				m.cursor = 1
 			}
+		} else if m.editMode {
+			// In edit mode, add the selected account and return
+			if m.cursor < len(m.accounts) {
+				selected := m.accounts[m.cursor].TradingAccountID
+				for _, ps := range m.pendingSlaves {
+					if ps.AccountID == selected || selected == m.masterID {
+						return m, nil
+					}
+				}
+				m.slaveID = selected
+				m.multInput.SetValue("1.0")
+				m.multErr = ""
+				m.screen = screenMultiplier
+				m.multInput.Focus()
+			}
 		} else {
-			// Don't allow same account for both
+			// "Done" option selected → go directly to startCopier
+			if m.cursor == len(m.accounts) {
+				if len(m.pendingSlaves) == 0 {
+					return m, nil
+				}
+				return m.startCopier()
+			}
+			// Selecting a slave account
+			selected := m.accounts[m.cursor].TradingAccountID
+			// Skip if it's the master or already in pending
 			if selected == m.masterID {
 				return m, nil
 			}
+			for _, ps := range m.pendingSlaves {
+				if ps.AccountID == selected {
+					return m, nil
+				}
+			}
 			m.slaveID = selected
+			// Reset multiplier input for this new slave
+			m.multInput.SetValue("1.0")
+			m.multErr = ""
 			m.screen = screenMultiplier
 			m.multInput.Focus()
 		}
 	case "esc", "b":
+		if m.editMode {
+			// In edit mode → return to edit screen
+			m.editMode = false
+			m.screen = screenEdit
+			return m, nil
+		}
 		if m.pickStep == pickSlave {
-			m.pickStep = pickMaster
-			m.masterID = ""
+			if len(m.pendingSlaves) > 0 {
+				// Pop the last pending slave
+				m.pendingSlaves = m.pendingSlaves[:len(m.pendingSlaves)-1]
+			} else {
+				m.pickStep = pickMaster
+				m.masterID = ""
+			}
 		}
 	}
 	return m, textinput.Blink
@@ -754,7 +853,6 @@ func (m Model) handleMultiplierKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "esc", "b":
 		m.screen = screenAccounts
-		m.pickStep = pickSlave
 		m.slaveID = ""
 		return m, nil
 	case "enter":
@@ -764,13 +862,177 @@ func (m Model) handleMultiplierKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.multErr = ""
-		m.multiplier = mult
+		m.pendingSlaveMult = mult
+
+		if m.editMode {
+			// Called from edit → update multiplier or add new slave
+			found := false
+			for i := range m.pendingSlaves {
+				if m.pendingSlaves[i].AccountID == m.slaveID {
+					m.pendingSlaves[i].Multiplier = mult
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.pendingSlaves = append(m.pendingSlaves, SlaveConfig{
+					AccountID: m.slaveID, Multiplier: mult,
+				})
+			}
+			m.slaveID = ""
+			m.editMode = false
+			m.screen = screenEdit
+			return m, nil
+		}
+		if m.slaveID != "" {
+			// Configuring a specific slave → append to pending and go back
+			m.pendingSlaves = append(m.pendingSlaves, SlaveConfig{
+				AccountID: m.slaveID, Multiplier: mult,
+			})
+			m.slaveID = ""
+			m.screen = screenAccounts
+			return m, nil
+		}
+		// "Done" selected → start the copier with all pending slaves
 		return m.startCopier()
 	}
 	var cmd tea.Cmd
 	m.multInput, cmd = m.multInput.Update(msg)
 	cmds = append(cmds, cmd)
 	return m, tea.Batch(cmds...)
+}
+
+func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	maxCursor := len(m.pendingSlaves) + 1 // +1 for "Add", +1 for "Apply"
+	if maxCursor < 0 {
+		maxCursor = 0
+	}
+
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < maxCursor {
+			m.cursor++
+		}
+	case "r":
+		// Remove selected slave
+		if m.cursor < len(m.pendingSlaves) {
+			m.pendingSlaves = append(m.pendingSlaves[:m.cursor], m.pendingSlaves[m.cursor+1:]...)
+			if m.cursor >= len(m.pendingSlaves) && m.cursor > 0 {
+				m.cursor--
+			}
+		}
+	case "m":
+		// Change multiplier of selected slave
+		if m.cursor < len(m.pendingSlaves) {
+			m.slaveID = m.pendingSlaves[m.cursor].AccountID
+			m.multInput.SetValue(fmt.Sprintf("%.2f", m.pendingSlaves[m.cursor].Multiplier))
+			m.multErr = ""
+			m.editMode = true
+			m.screen = screenMultiplier
+			m.multInput.Focus()
+		}
+	case "enter", " ":
+		// "Add slave" option
+		if m.cursor == len(m.pendingSlaves) {
+			m.editMode = true
+			m.pickStep = pickSlave
+			m.slaveID = ""
+			m.cursor = 0
+			m.screen = screenAccounts
+			return m, nil
+		}
+		// "Apply & restart" option
+		if m.cursor == len(m.pendingSlaves)+1 {
+			if len(m.pendingSlaves) == 0 {
+				return m, nil
+			}
+			return m.applyEdit()
+		}
+	case "esc", "b":
+		// Discard changes, back to copying
+		m.screen = screenCopying
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) applyEdit() (tea.Model, tea.Cmd) {
+	email := strings.TrimSpace(m.emailInput.Value())
+
+	// Save updated config
+	saveConfig(SavedConfig{
+		Email:    email,
+		Password: m.passInput.Value(),
+		MasterID: m.masterID,
+		Slaves:   m.pendingSlaves,
+	})
+
+	// Rebuild slave clients
+	// For existing slaves, keep the client (no re-login needed)
+	// For new slaves, create new clients (they will be logged in below)
+	oldByID := make(map[string]*slaveClient)
+	for _, sc := range m.slaves {
+		oldByID[sc.config.AccountID] = sc
+	}
+
+	newSlaves := make([]*slaveClient, 0, len(m.pendingSlaves))
+	var needLogin []SlaveConfig
+	for _, cfg := range m.pendingSlaves {
+		if sc, ok := oldByID[cfg.AccountID]; ok {
+			// Update multiplier on existing slave
+			sc.config.Multiplier = cfg.Multiplier
+			newSlaves = append(newSlaves, sc)
+		} else {
+			needLogin = append(needLogin, cfg)
+		}
+	}
+	m.slaves = newSlaves
+
+	if len(needLogin) == 0 {
+		m.screen = screenCopying
+		m.log(LogOK, "Slave configuration updated")
+		return m, m.cmdSchedulePoll()
+	}
+
+	// Log in new slaves in background
+	pass := m.passInput.Value()
+	return m, func() tea.Msg {
+		var errs []string
+		for _, cfg := range needLogin {
+			sc := &slaveClient{
+				client: &Client{http: m.sharedJar.http},
+				config: cfg,
+				known:  make(map[string]Position),
+			}
+			slaveAccounts, err := sc.client.LoginAll(email, pass)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("slave #%s login: %v", cfg.AccountID, err))
+				continue
+			}
+			if err := sc.client.SelectAccount(slaveAccounts, cfg.AccountID); err != nil {
+				errs = append(errs, fmt.Sprintf("slave #%s select: %v", cfg.AccountID, err))
+				continue
+			}
+			// Seed known positions from master
+			for id, pos := range m.known {
+				sc.known[id] = pos
+			}
+			m.slaves = append(m.slaves, sc)
+		}
+		errStr := ""
+		if len(errs) > 0 {
+			errStr = strings.Join(errs, "; ")
+			m.log(LogErr, "Edit apply: "+errStr)
+		}
+		m.log(LogOK, "Slave configuration updated")
+		return msgEditApplied{err: nil}
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -798,22 +1060,33 @@ func (m Model) doLogin() (tea.Model, tea.Cmd) {
 func (m Model) startCopier() (tea.Model, tea.Cmd) {
 	email := strings.TrimSpace(m.emailInput.Value())
 
-	// Save config
+	// Save config with all pending slaves
+	slaves := m.pendingSlaves
+	if len(slaves) == 0 {
+		// Fallback: should not happen (Done requires ≥1 slave)
+		slaves = []SlaveConfig{{AccountID: m.slaveID, Multiplier: m.pendingSlaveMult}}
+	}
 	saveConfig(SavedConfig{
-		Email:      email,
-		Password:   m.passInput.Value(),
-		MasterID:   m.masterID,
-		SlaveID:    m.slaveID,
-		Multiplier: m.multiplier,
+		Email:    email,
+		Password: m.passInput.Value(),
+		MasterID: m.masterID,
+		Slaves:   slaves,
 	})
 
-	// Both clients share the same jar (same login session = same co-auth cookie)
-	// but each needs its own tradingApiToken for the selected account
+	// Master uses the shared jar (co-auth session)
 	m.master = &Client{http: m.sharedJar.http}
-	m.slave = NewClient()
-
-	// Slave needs its own session (different tradingApiToken)
 	pass := m.passInput.Value()
+
+	// Create slave clients from pending configs
+	m.slaves = make([]*slaveClient, 0, len(slaves))
+	for _, s := range slaves {
+		sc := &slaveClient{
+			client: &Client{http: m.sharedJar.http},
+			config: s,
+			known:  make(map[string]Position),
+		}
+		m.slaves = append(m.slaves, sc)
+	}
 
 	return m, func() tea.Msg {
 		// Select master from already-logged-in accounts
@@ -821,22 +1094,36 @@ func (m Model) startCopier() (tea.Model, tea.Cmd) {
 			return msgLoginDone{err: fmt.Errorf("master: %w", err)}
 		}
 
-		// Log slave in separately to get its own tradingApiToken
-		slaveAccounts, err := m.slave.LoginAll(email, pass)
-		if err != nil {
-			return msgLoginDone{err: fmt.Errorf("slave login: %w", err)}
-		}
-		if err := m.slave.SelectAccount(slaveAccounts, m.slaveID); err != nil {
-			return msgLoginDone{err: fmt.Errorf("slave: %w", err)}
+		// Log in all slaves (use same credentials for each)
+		var slaveErrs []string
+		for _, sc := range m.slaves {
+			slaveAccounts, err := sc.client.LoginAll(email, pass)
+			if err != nil {
+				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s login: %v", sc.config.AccountID, err))
+				continue
+			}
+			if err := sc.client.SelectAccount(slaveAccounts, sc.config.AccountID); err != nil {
+				slaveErrs = append(slaveErrs, fmt.Sprintf("slave #%s select: %v", sc.config.AccountID, err))
+			}
 		}
 
-		// Seed existing master positions
+		// Seed existing master positions — shared across all slaves
 		pos, err := m.master.GetOpenPositions()
 		if err != nil {
+			if len(slaveErrs) > 0 {
+				return msgSeedDone{err: fmt.Errorf("seed: %v; slave errors: %s", err, strings.Join(slaveErrs, "; "))}
+			}
 			return msgSeedDone{err: err}
 		}
 		for _, p := range pos {
 			m.known[p.ID] = p
+			for _, sc := range m.slaves {
+				sc.known[p.ID] = p
+			}
+		}
+
+		if len(slaveErrs) > 0 {
+			return msgSeedDone{err: fmt.Errorf("slave errors: %s", strings.Join(slaveErrs, "; "))}
 		}
 		return msgSeedDone{count: len(pos)}
 	}
@@ -895,13 +1182,12 @@ func (m *Model) doPoll() {
 	}
 	masterPos, err := m.master.GetOpenPositions()
 	if err != nil {
-		m.stats.errors++
 		m.log(LogErr, "Poll: "+err.Error())
 		return
 	}
 	current := posMap(masterPos)
 
-	// New → open on slave
+	// For each master position change, apply to ALL slaves
 	for id, pos := range current {
 		if _, known := m.known[id]; !known {
 			side := styleGreen.Render(pos.Side)
@@ -910,46 +1196,52 @@ func (m *Model) doPoll() {
 			}
 			m.log(LogTrade, fmt.Sprintf("NEW %s  %-8s  vol=%-6s  @ %s",
 				side, pos.Symbol, pos.Volume, pos.OpenPrice))
-			if err := m.slave.OpenPosition(pos, m.multiplier); err != nil {
-				m.stats.errors++
-				m.log(LogErr, "  ↳ failed to open on slave: "+err.Error())
-			} else {
-				m.stats.copied++
-				scaledVol := pos.Volume
-				if v, e2 := strconv.ParseFloat(pos.Volume, 64); e2 == nil {
-					scaledVol = fmt.Sprintf("%.2f", math.Round(v*m.multiplier*100)/100)
+
+			for _, sc := range m.slaves {
+				mult := sc.config.Multiplier
+				if err := sc.client.OpenPosition(pos, mult); err != nil {
+					sc.errors++
+					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s open failed: %s", sc.client.accountID, err.Error()))
+				} else {
+					sc.copied++
+					scaledVol := pos.Volume
+					if v, e2 := strconv.ParseFloat(pos.Volume, 64); e2 == nil {
+						scaledVol = fmt.Sprintf("%.2f", math.Round(v*mult*100)/100)
+					}
+					m.log(LogOK, fmt.Sprintf("  ↳ slave #%s opened  vol=%s ✓", sc.client.accountID, scaledVol))
 				}
-				m.log(LogOK, fmt.Sprintf("  ↳ opened on slave  vol=%s ✓", scaledVol))
 			}
 		}
 	}
 
-	// Closed → close on slave
+	// Closed → close on all slaves
 	for id, pos := range m.known {
 		if _, stillOpen := current[id]; !stillOpen {
-			m.log(LogTrade, fmt.Sprintf("CLOSED %-6s %-8s → closing slave...", pos.Side, pos.Symbol))
-			slavePos, err := m.slave.GetOpenPositions()
-			if err != nil {
-				m.stats.errors++
-				m.log(LogErr, "  ↳ could not fetch slave positions: "+err.Error())
-				continue
-			}
-			found := false
-			for _, sp := range slavePos {
-				if sp.Symbol == pos.Symbol && sp.Side == pos.Side {
-					if err := m.slave.ClosePosition(sp); err != nil {
-						m.stats.errors++
-						m.log(LogErr, "  ↳ failed to close: "+err.Error())
-					} else {
-						m.stats.closed++
-						m.log(LogOK, fmt.Sprintf("  ↳ closed on slave ✓  P&L was %s", sp.Profit))
-						found = true
-					}
-					break
+			m.log(LogTrade, fmt.Sprintf("CLOSED %-6s %-8s → closing on slaves...", pos.Side, pos.Symbol))
+			for _, sc := range m.slaves {
+				slavePos, err := sc.client.GetOpenPositions()
+				if err != nil {
+					sc.errors++
+					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s: could not fetch positions: %s", sc.client.accountID, err.Error()))
+					continue
 				}
-			}
-			if !found {
-				m.log(LogErr, fmt.Sprintf("  ↳ no matching slave position for %s %s", pos.Side, pos.Symbol))
+				found := false
+				for _, sp := range slavePos {
+					if sp.Symbol == pos.Symbol && sp.Side == pos.Side {
+						if err := sc.client.ClosePosition(sp); err != nil {
+							sc.errors++
+							m.log(LogErr, fmt.Sprintf("  ↳ slave #%s close failed: %s", sc.client.accountID, err.Error()))
+						} else {
+							sc.closed++
+							m.log(LogOK, fmt.Sprintf("  ↳ slave #%s closed ✓  P&L was %s", sc.client.accountID, sp.Profit))
+							found = true
+						}
+						break
+					}
+				}
+				if !found {
+					m.log(LogErr, fmt.Sprintf("  ↳ slave #%s: no matching position for %s %s", sc.client.accountID, pos.Side, pos.Symbol))
+				}
 			}
 		}
 	}
@@ -957,14 +1249,14 @@ func (m *Model) doPoll() {
 	m.known = current
 
 	masterBal, _ := m.master.GetBalance()
-	slaveBal, _ := m.slave.GetBalance()
-	slavePos, _ := m.slave.GetOpenPositions()
+	for _, sc := range m.slaves {
+		sc.balance, _ = sc.client.GetBalance()
+		sc.positions, _ = sc.client.GetOpenPositions()
+	}
 
 	m.stats.mu.Lock()
 	m.stats.masterPos = masterPos
-	m.stats.slavePos = slavePos
 	m.stats.masterBalance = masterBal
-	m.stats.slaveBalance = slaveBal
 	m.stats.lastPoll = time.Now()
 	m.stats.mu.Unlock()
 }
@@ -983,6 +1275,8 @@ func (m Model) View() string {
 		return m.viewMultiplier()
 	case screenCopying:
 		return m.viewCopying()
+	case screenEdit:
+		return m.viewEdit()
 	}
 	return ""
 }
@@ -993,8 +1287,9 @@ func (m Model) viewLogin() string {
 	// Pre-fill notice
 	notice := ""
 	if cfg := loadConfig(); cfg != nil {
-		notice = styleDim.Render(fmt.Sprintf("  Saved config found — last used: master #%s → slave #%s  ×%.2f",
-			cfg.MasterID, cfg.SlaveID, cfg.Multiplier))
+		slaveCount := len(cfg.Slaves)
+		suffix := fmt.Sprintf("master #%s → %d slave(s)", cfg.MasterID, slaveCount)
+		notice = styleDim.Render("  Saved config found — " + suffix)
 	}
 
 	emailBox := styleInput.Render(m.emailInput.View())
@@ -1044,14 +1339,29 @@ func (m Model) viewAccounts() string {
 	if m.pickStep == pickMaster {
 		stepLabel = styleMasterTag.Render(" MASTER ") + styleDim.Render("  Choose the account to copy FROM")
 	} else {
-		stepLabel = styleSlaveTag.Render(" SLAVE ") + styleDim.Render("  Choose the account to copy TO") +
-			"  " + styleDim.Render("master: ") + styleBlue.Render("#"+m.masterID)
+		// Show pending slaves count
+		pendingStr := ""
+		if len(m.pendingSlaves) > 0 {
+			var ids []string
+			for _, ps := range m.pendingSlaves {
+				ids = append(ids, "#"+ps.AccountID+"×"+fmt.Sprintf("%.2f", ps.Multiplier))
+			}
+			pendingStr = "  " + styleDim.Render("| selected: ") + styleGreen.Render(strings.Join(ids, ", "))
+		}
+		stepLabel = styleSlaveTag.Render(" SLAVE ") + styleDim.Render("  Choose accounts to copy TO") +
+			"  " + styleDim.Render("master: ") + styleBlue.Render("#"+m.masterID) + pendingStr
+	}
+
+	// Build a set of already-picked slave IDs
+	pickedIDs := make(map[string]bool)
+	for _, ps := range m.pendingSlaves {
+		pickedIDs[ps.AccountID] = true
 	}
 
 	var rows []string
 	for i, acc := range m.accounts {
 		isMaster := acc.TradingAccountID == m.masterID
-		isSlave := acc.TradingAccountID == m.slaveID
+		isPicked := pickedIDs[acc.TradingAccountID]
 
 		name := acc.Offer.Description
 		if name == "" {
@@ -1066,12 +1376,12 @@ func (m Model) viewAccounts() string {
 		if isMaster {
 			tags = "  " + styleMasterTag.Render(" MASTER ")
 		}
-		if isSlave {
+		if isPicked {
 			tags = "  " + styleSlaveTag.Render(" SLAVE ")
 		}
 
-		// Dim accounts that are already selected as master during slave pick
-		isDisabled := m.pickStep == pickSlave && isMaster
+		// Dim accounts that are master or already picked (during slave pick)
+		isDisabled := m.pickStep == pickSlave && (isMaster || isPicked)
 
 		line := fmt.Sprintf("  #%-10s  %-8s  %-30s  [%s]%s",
 			acc.TradingAccountID,
@@ -1083,15 +1393,25 @@ func (m Model) viewAccounts() string {
 
 		var row string
 		if isDisabled {
-			row = styleDim.Render(line + "  (already master)")
+			row = styleDim.Render(line + "  (already selected)")
 		} else if i == m.cursor {
 			row = styleAccountRowFocused.Render(line)
-		} else if isMaster || isSlave {
+		} else if isMaster || isPicked {
 			row = styleAccountRowSelected.Render(line)
 		} else {
 			row = styleAccountRow.Render(line)
 		}
 		rows = append(rows, row)
+	}
+
+	// Add "Done" option at the bottom in pickSlave mode (but not during edit)
+	if m.pickStep == pickSlave && !m.editMode {
+		doneLabel := "  ✓  Done selecting slaves"
+		if m.cursor == len(m.accounts) {
+			rows = append(rows, styleAccountRowFocused.Render(doneLabel))
+		} else {
+			rows = append(rows, styleAccountRow.Render(doneLabel))
+		}
 	}
 
 	list := stylePanel.Render(strings.Join(rows, "\n"))
@@ -1111,11 +1431,34 @@ func (m Model) viewAccounts() string {
 func (m Model) viewMultiplier() string {
 	title := styleTitle.Render("  ◈  Lot Multiplier  ")
 
-	summary := lipgloss.JoinHorizontal(lipgloss.Top,
-		styleDim.Render("Master  "), styleMasterTag.Render(" #"+m.masterID+" "),
-		styleDim.Render("  →  "),
-		styleSlaveTag.Render(" #"+m.slaveID+" "), styleDim.Render("  Slave"),
-	)
+	var summary string
+	var btn string
+	if m.slaveID != "" {
+		// Configuring a specific slave
+		summary = lipgloss.JoinHorizontal(lipgloss.Top,
+			styleDim.Render("Master  "), styleMasterTag.Render(" #"+m.masterID+" "),
+			styleDim.Render("  →  "),
+			styleSlaveTag.Render(" #"+m.slaveID+" "), styleDim.Render("  Slave"),
+		)
+		btn = styleBtnFocused.Render(" ▶  Add Slave  ")
+	} else {
+		// Starting copier with all pending slaves
+		var pendingStr string
+		if len(m.pendingSlaves) > 0 {
+			var ids []string
+			for _, ps := range m.pendingSlaves {
+				ids = append(ids, "#"+ps.AccountID+"×"+fmt.Sprintf("%.2f", ps.Multiplier))
+			}
+			pendingStr = styleGreen.Render(strings.Join(ids, ", "))
+		}
+		summary = lipgloss.JoinHorizontal(lipgloss.Top,
+			styleDim.Render("Master  "), styleMasterTag.Render(" #"+m.masterID+" "),
+			styleDim.Render("  →  "),
+			styleSlaveTag.Render(fmt.Sprintf(" %d slave(s) ", len(m.pendingSlaves))),
+			"  "+pendingStr,
+		)
+		btn = styleBtnFocused.Render(" ▶  Start Copier  ")
+	}
 
 	desc := styleDim.Render("  Scale slave lot size relative to master.\n  1.0 = same size  ·  0.5 = half  ·  2.0 = double")
 
@@ -1126,7 +1469,6 @@ func (m Model) viewMultiplier() string {
 		errLine = "\n" + styleLogErr.Render("  ⚠  "+m.multErr)
 	}
 
-	btn := styleBtnFocused.Render(" ▶  Start Copier  ")
 	help := styleDim.Render("  Enter  confirm    Esc / b  back    Ctrl+C  quit")
 
 	inner := lipgloss.JoinVertical(lipgloss.Left,
@@ -1145,14 +1487,22 @@ func (m Model) viewMultiplier() string {
 func (m Model) viewCopying() string {
 	m.stats.mu.Lock()
 	masterPos := m.stats.masterPos
-	slavePos := m.stats.slavePos
 	masterBal := m.stats.masterBalance
-	slaveBal := m.stats.slaveBalance
-	copied := m.stats.copied
-	closed := m.stats.closed
-	errors := m.stats.errors
 	lastPoll := m.stats.lastPoll
 	m.stats.mu.Unlock()
+
+	// Aggregate stats from all slaves
+	totalCopied := 0
+	totalClosed := 0
+	totalErrors := 0
+	var slavePanels []string
+	for i, sc := range m.slaves {
+		totalCopied += sc.copied
+		totalClosed += sc.closed
+		totalErrors += sc.errors
+		label := fmt.Sprintf("SLAVE %d", i+1)
+		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, stylePanelSlave, 52))
+	}
 
 	// Header
 	pollAge := ""
@@ -1166,25 +1516,24 @@ func (m Model) viewCopying() string {
 	)
 
 	// Stats
-	cpBadge := styleBadgeGreen.Render(fmt.Sprintf(" ✓ %d copied ", copied))
-	clBadge := styleBadgeAmber.Render(fmt.Sprintf(" ⊘ %d closed ", closed))
+	cpBadge := styleBadgeGreen.Render(fmt.Sprintf(" ✓ %d copied ", totalCopied))
+	clBadge := styleBadgeAmber.Render(fmt.Sprintf(" ⊘ %d closed ", totalClosed))
 	errBadge := styleDim.Render("")
-	if errors > 0 {
-		errBadge = styleBadgeRed.Render(fmt.Sprintf(" ✗ %d errors ", errors))
+	if totalErrors > 0 {
+		errBadge = styleBadgeRed.Render(fmt.Sprintf(" ✗ %d errors ", totalErrors))
 	}
-	mult := styleDim.Render(fmt.Sprintf("  ×%.2f", m.multiplier))
-	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", errBadge, mult)
+	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", errBadge)
 
 	// Account panels
-	panelW := 56
+	panelW := 52
 	masterPanel := m.renderAccount("MASTER", m.master, masterBal, masterPos, stylePanelMaster, panelW)
-	slavePanel := m.renderAccount("SLAVE", m.slave, slaveBal, slavePos, stylePanelSlave, panelW)
-	panels := lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, "  ", slavePanel)
+	panels := lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, "  ")
+	panels += lipgloss.JoinHorizontal(lipgloss.Top, slavePanels...)
 
 	// Log
 	logView := m.renderLog()
 
-	footer := styleDim.Render("  q  quit    l  logout")
+	footer := styleDim.Render("  q  quit    l  logout    e  edit")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header, "",
@@ -1193,6 +1542,56 @@ func (m Model) viewCopying() string {
 		logView, "",
 		footer,
 	)
+}
+
+func (m Model) viewEdit() string {
+	title := styleTitle.Render("  ◈  Edit Configuration  ")
+
+	masterLine := styleBlue.Render("⬟ MASTER") + "  " + styleLabel.Render("#"+m.masterID)
+
+	var rows []string
+	rows = append(rows, "  "+masterLine, "")
+
+	if len(m.pendingSlaves) == 0 {
+		rows = append(rows, styleDim.Render("  — no slaves configured —"))
+	} else {
+		for i, ps := range m.pendingSlaves {
+			line := fmt.Sprintf("  SLAVE %d:  #%-10s  ×%.2f", i+1, ps.AccountID, ps.Multiplier)
+			if i == m.cursor {
+				rows = append(rows, styleAccountRowFocused.Render(line))
+			} else {
+				rows = append(rows, styleAccountRow.Render(line))
+			}
+		}
+	}
+
+	// "Add slave" option
+	addLine := "  [+] Add slave"
+	if m.cursor == len(m.pendingSlaves) {
+		rows = append(rows, styleAccountRowFocused.Render(addLine))
+	} else {
+		rows = append(rows, styleAccountRow.Render(addLine))
+	}
+
+	// "Apply" option
+	applyLine := "  [>] Apply & restart copier"
+	if m.cursor == len(m.pendingSlaves)+1 {
+		rows = append(rows, styleAccountRowFocused.Render(applyLine))
+	} else {
+		rows = append(rows, styleAccountRow.Render(applyLine))
+	}
+
+	list := stylePanel.Render(strings.Join(rows, "\n"))
+
+	help := styleDim.Render("  ↑↓  navigate    r  remove slave    m  change multiplier    Enter  confirm    Esc  back    q  quit")
+
+	inner := lipgloss.JoinVertical(lipgloss.Left,
+		title, "",
+		list,
+		"", help,
+	)
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, inner)
 }
 
 func (m Model) renderAccount(label string, c *Client, bal *BalanceResponse, positions []Position, st lipgloss.Style, w int) string {
