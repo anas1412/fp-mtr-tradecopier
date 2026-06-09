@@ -770,6 +770,20 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.spinner.Tick, textinput.Blink)
 }
 
+// contentOffset returns the estimated (top, left) centering offset for a block
+// of the given width and height, based on the current terminal dimensions.
+func (m Model) contentOffset(contentW, contentH int) (int, int) {
+	top := 0
+	if m.height > contentH {
+		top = (m.height - contentH) / 2
+	}
+	left := 0
+	if m.width > contentW {
+		left = (m.width - contentW) / 2
+	}
+	return top, left
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Update
 // ────────────────────────────────────────────────────────────────────────────
@@ -786,6 +800,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			return m.handleClick(msg.X, msg.Y)
+		}
 
 	case tea.KeyMsg:
 		switch m.screen {
@@ -959,6 +978,58 @@ func (m Model) handleLoginKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// handleAccountsEnter is the Enter handler, extracted for reuse by mouse clicks.
+func (m Model) handleAccountsEnter() (tea.Model, tea.Cmd) {
+	if m.pickStep == pickMaster {
+		selected := m.accounts[m.cursor].TradingAccountID
+		m.masterID = selected
+		m.pickStep = pickSlave
+		m.cursor = 0
+		if m.cursor < len(m.accounts) && m.accounts[m.cursor].TradingAccountID == m.masterID && len(m.accounts) > 1 {
+			m.cursor = 1
+		}
+	} else if m.editMode {
+		// In edit mode, add the selected account and return
+		if m.cursor < len(m.accounts) {
+			selected := m.accounts[m.cursor].TradingAccountID
+			for _, ps := range m.pendingSlaves {
+				if ps.AccountID == selected || selected == m.masterID {
+					return m, nil
+				}
+			}
+			m.slaveID = selected
+			m.multInput.SetValue("1.0")
+			m.multErr = ""
+			m.screen = screenMultiplier
+			m.multInput.Focus()
+		}
+	} else {
+		// "Done" option selected → go directly to startCopier
+		if m.cursor == len(m.accounts) {
+			if len(m.pendingSlaves) == 0 {
+				return m, nil
+			}
+			return m.startCopier()
+		}
+		// Selecting a slave account
+		selected := m.accounts[m.cursor].TradingAccountID
+		if selected == m.masterID {
+			return m, nil
+		}
+		for _, ps := range m.pendingSlaves {
+			if ps.AccountID == selected {
+				return m, nil
+			}
+		}
+		m.slaveID = selected
+		m.multInput.SetValue("1.0")
+		m.multErr = ""
+		m.screen = screenMultiplier
+		m.multInput.Focus()
+	}
+	return m, nil
+}
+
 func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// In pickSlave mode, the cursor can go up to len(accounts) (the "Done" option)
 	// except during edit mode where we only pick one slave at a time
@@ -979,55 +1050,7 @@ func (m Model) handleAccountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case "enter", " ":
-		if m.pickStep == pickMaster {
-			selected := m.accounts[m.cursor].TradingAccountID
-			m.masterID = selected
-			m.pickStep = pickSlave
-			m.cursor = 0
-			if m.cursor < len(m.accounts) && m.accounts[m.cursor].TradingAccountID == m.masterID && len(m.accounts) > 1 {
-				m.cursor = 1
-			}
-		} else if m.editMode {
-			// In edit mode, add the selected account and return
-			if m.cursor < len(m.accounts) {
-				selected := m.accounts[m.cursor].TradingAccountID
-				for _, ps := range m.pendingSlaves {
-					if ps.AccountID == selected || selected == m.masterID {
-						return m, nil
-					}
-				}
-				m.slaveID = selected
-				m.multInput.SetValue("1.0")
-				m.multErr = ""
-				m.screen = screenMultiplier
-				m.multInput.Focus()
-			}
-		} else {
-			// "Done" option selected → go directly to startCopier
-			if m.cursor == len(m.accounts) {
-				if len(m.pendingSlaves) == 0 {
-					return m, nil
-				}
-				return m.startCopier()
-			}
-			// Selecting a slave account
-			selected := m.accounts[m.cursor].TradingAccountID
-			// Skip if it's the master or already in pending
-			if selected == m.masterID {
-				return m, nil
-			}
-			for _, ps := range m.pendingSlaves {
-				if ps.AccountID == selected {
-					return m, nil
-				}
-			}
-			m.slaveID = selected
-			// Reset multiplier input for this new slave
-			m.multInput.SetValue("1.0")
-			m.multErr = ""
-			m.screen = screenMultiplier
-			m.multInput.Focus()
-		}
+		return m.handleAccountsEnter()
 	case "esc", "b":
 		if m.editMode {
 			// In edit mode → return to edit screen
@@ -1197,6 +1220,115 @@ func (m Model) handleSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.settingsInput, _ = m.settingsInput.Update(msg)
 		return m, nil
 	}
+}
+
+// handleClick maps a mouse click (x, y) to the appropriate action based on
+// the current screen. Y is 0-indexed from top of terminal.
+func (m Model) handleClick(x, y int) (tea.Model, tea.Cmd) {
+	switch m.screen {
+	case screenLogin:
+		// Approximate layout (centered vertically):
+		//   title (~3-4 lines)
+		//   saved config notice (optional, 1 line)
+		//   "Email" label
+		//   email input
+		//   ""
+		//   "Password" label
+		//   password input
+		//   ""
+		//   Sign In button
+		//   error/status
+		//   ""
+		//   help
+		cfg := loadConfig()
+		noticeLines := 0
+		if cfg != nil && cfg.MasterID != "" {
+			noticeLines = 1
+		}
+		titleH := 3 // double border + text
+		totalH := titleH + 1 + noticeLines + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+		top, _ := m.contentOffset(60, totalH)
+		row := y - top
+		emailRow := titleH + 1 + noticeLines + 1 // "Email" label row
+		passRow := emailRow + 1 + 1 + 1          // input + empty + "Password" label
+		btnRow := passRow + 1 + 1 + 1            // input + empty
+		if row == emailRow || (row >= emailRow && row < passRow-1) {
+			m.loginFocus = 0
+			m.emailInput.Focus()
+			m.passInput.Blur()
+		} else if row == passRow || (row >= passRow && row < btnRow-1) {
+			m.loginFocus = 1
+			m.passInput.Focus()
+			m.emailInput.Blur()
+		} else if row == btnRow {
+			m.loginFocus = 2
+			m.emailInput.Blur()
+			m.passInput.Blur()
+			return m.doLogin()
+		}
+
+	case screenAccounts:
+		// layout: title (~3) + "" + stepLabel + "" + panel_top + N rows + panel_bottom + "" + help
+		n := len(m.accounts)
+		if m.pickStep == pickSlave && !m.editMode {
+			n++ // Done button
+		}
+		titleH := 3
+		totalH := titleH + 1 + 2 + 1 + 1 + n + 1 + 1 + 1
+		top, _ := m.contentOffset(72, totalH)
+		rowStart := top + titleH + 1 + 2 + 1 + 1 // above the panel border
+		row := y - rowStart
+		if row >= 0 && row < len(m.accounts) {
+			m.cursor = row
+			// Act like Enter was pressed on this row
+			return m.handleAccountsEnter()
+		}
+		if row == len(m.accounts) && m.pickStep == pickSlave && !m.editMode {
+			m.cursor = row
+			return m.handleAccountsEnter()
+		}
+
+	case screenEdit:
+		n := len(m.pendingSlaves) + 2 // rows + Add + Apply
+		titleH := 3
+		totalH := titleH + 1 + 1 + n + 1 + 1 + 1
+		top, _ := m.contentOffset(72, totalH)
+		rowStart := top + titleH + 1 + 1 + 1 // above panel border
+		row := y - rowStart
+		if row >= 0 && row < n {
+			m.cursor = row
+			// Trigger the same action as pressing Enter on the focused row
+			if row == len(m.pendingSlaves) {
+				// "Add slave" — same as handleEditKey's Enter handler
+				m.editMode = true
+				m.pickStep = pickSlave
+				m.slaveID = ""
+				m.cursor = 0
+				m.screen = screenAccounts
+				return m, nil
+			}
+			if row == len(m.pendingSlaves)+1 {
+				// "Apply & restart"
+				if len(m.pendingSlaves) > 0 {
+					return m.applyEdit()
+				}
+			}
+		}
+
+	case screenMultiplier:
+		// Click on the input area ~ centered vertically
+		titleH := 3
+		totalH := titleH + 1 + 2 + 2 + 1 + 1 + 1 + 1 + 1 + 1
+		top, _ := m.contentOffset(60, totalH)
+		row := y - top
+		inputRow := titleH + 1 + 2 + 2
+		btnRow := inputRow + 1 + 1 // input + empty
+		if row >= inputRow && row < btnRow-1 {
+			m.multInput.Focus()
+		}
+	}
+
+	return m, nil
 }
 
 func (m Model) applyEdit() (tea.Model, tea.Cmd) {
@@ -1824,6 +1956,16 @@ func (m Model) viewCopying() string {
 	totalPendCopied := 0
 	totalPendCancelled := 0
 	totalErrors := 0
+	// Calculate responsive panel width based on terminal width
+	nPanels := 1 + len(m.slaves)
+	panelW := 52
+	gap := 2
+	if m.width > 0 {
+		available := m.width - 4
+		maxW := (available - (nPanels-1)*gap) / nPanels
+		panelW = max(36, min(56, maxW))
+	}
+
 	var slavePanels []string
 	for i, sc := range m.slaves {
 		totalCopied += sc.copied
@@ -1832,7 +1974,7 @@ func (m Model) viewCopying() string {
 		totalPendCancelled += sc.pendingCancelled
 		totalErrors += sc.errors
 		label := fmt.Sprintf("SLAVE %d", i+1)
-		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, sc.pendingKnown, stylePanelSlave, 52))
+		slavePanels = append(slavePanels, m.renderAccount(label, sc.client, sc.balance, sc.positions, sc.pendingKnown, stylePanelSlave, panelW))
 	}
 
 	// Header
@@ -1863,11 +2005,20 @@ func (m Model) viewCopying() string {
 	}
 	statsBar := lipgloss.JoinHorizontal(lipgloss.Top, cpBadge, "  ", clBadge, "  ", pcBadge, "  ", pdBadge, "  ", errBadge)
 
-	// Account panels
-	panelW := 52
 	masterPanel := m.renderAccount("MASTER", m.master, masterBal, masterPos, pendingMap(masterPending), stylePanelMaster, panelW)
-	panels := lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, "  ")
-	panels += lipgloss.JoinHorizontal(lipgloss.Top, slavePanels...)
+
+	// Stack vertically if terminal is too narrow, else lay out horizontally
+	var panels string
+	if m.width > 0 && m.width < nPanels*(panelW+gap)+4 {
+		// Vertical stacking
+		panels = masterPanel
+		for _, sp := range slavePanels {
+			panels += "\n\n" + sp
+		}
+	} else {
+		panels = lipgloss.JoinHorizontal(lipgloss.Top, masterPanel, strings.Repeat(" ", gap))
+		panels += lipgloss.JoinHorizontal(lipgloss.Top, slavePanels...)
+	}
 
 	// Log
 	logView := m.renderLog()
@@ -2052,7 +2203,7 @@ func init() {} // nothing needed, handled in Update above
 // ────────────────────────────────────────────────────────────────────────────
 
 func main() {
-	p := tea.NewProgram(newModel(), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
